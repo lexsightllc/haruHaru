@@ -2,7 +2,6 @@
 # NOTE: This is a Python script (not JavaScript). Reviews/tooling should treat it as Python.
 
 import os
-# import sys  # unused
 
 # Disable debugger warnings
 os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
@@ -16,12 +15,12 @@ logger = logging.getLogger("pipeline")
 import gc
 import json
 import hashlib
-# import pickle  # joblib handles serialization internally; avoid importing pickle directly
 import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Union, Any
 import tracemalloc
+from urllib.error import URLError, HTTPError  # for precise NLTK download errors
 
 import numpy as np
 import pandas as pd
@@ -67,38 +66,35 @@ except ImportError:
 import nltk
 NLTK_AVAILABLE = True
 _nltk_error = getattr(nltk, "NLTKError", LookupError)
-_NLTK_FALLBACK_ERRORS = (OSError,)
-if isinstance(_nltk_error, type) and not issubclass(_nltk_error, LookupError):
-    _NLTK_FALLBACK_ERRORS = (OSError, _nltk_error)
-_POS_TAGGER_RESOURCES = (
-    "averaged_perceptron_tagger",
-    "averaged_perceptron_tagger_eng",
-)
+
 try:
-    # Try Kaggle's pre-downloaded path
+    # NLTK resource probing & fallback (uses new/old tagger names)
     nltk.data.path.append('/kaggle/input/nltk-data/')
-    # Try to use existing data without downloading
-    nltk.data.find('tokenizers/punkt')
-    try:
-        nltk.data.find('taggers/averaged_perceptron_tagger_eng')
-    except LookupError:
-        nltk.data.find('taggers/averaged_perceptron_tagger')
-except LookupError as exc:
-    # Only try download if not in Kaggle
-    if not os.path.exists('/kaggle'):
+
+    def _has_tagger():
         try:
-            nltk.download('punkt', quiet=True)
-            for resource in _POS_TAGGER_RESOURCES:
-                nltk.download(resource, quiet=True)
-        except Exception as download_exc:  # noqa: BLE001
-            NLTK_AVAILABLE = False
-            warnings.warn(
-                "Unable to download NLTK resources: "
-                f"{download_exc} (triggered by {exc})"
-            )
+            nltk.data.find('taggers/averaged_perceptron_tagger_eng')
+            return True
+        except LookupError:
+            try:
+                nltk.data.find('taggers/averaged_perceptron_tagger')
+                return True
+            except LookupError:
+                return False
+
+    nltk.data.find('tokenizers/punkt')
+    if not _has_tagger():
+        raise LookupError("POS tagger not found")
+except LookupError:
+    if not os.path.exists('/kaggle'):
+        nltk.download('punkt', quiet=True)
+        try:
+            nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+        except (URLError, HTTPError, OSError):
+            nltk.download('averaged_perceptron_tagger', quiet=True)
     else:
         NLTK_AVAILABLE = False
-except _NLTK_FALLBACK_ERRORS as exc:
+except (LookupError, OSError) as exc:
     NLTK_AVAILABLE = False
     warnings.warn(f"NLTK resources unavailable: {exc}")
 
@@ -126,8 +122,7 @@ def set_all_seeds(seed=42):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-# For library use, prefer calling set_all_seeds() from main(). Left here for script use:
-set_all_seeds(42)
+# For library use, call set_all_seeds() in main(); avoid side effects on import.
 
 @dataclass
 class TrainSpec:
@@ -171,6 +166,7 @@ class TrainSpec:
     use_augmentation: bool = True
     augmentation_ratio: float = 0.2
     augmentation_max: int = 200
+    augmentation_noise_std: float = 0.01  # documentable knob
     
     calibration_mode: str = "sigmoid"
     min_samples_isotonic: int = 300
@@ -277,10 +273,22 @@ class RobustFeatureEngineer:
             init='nndsvda'
         )
         self.topic_model.fit(topic_matrix)
-        
+
+        # Fit SVD & scaler here to avoid leakage (moved from transform)
+        word_features = self.word_vectorizer.transform(texts_clean)
+        char_features = self.char_vectorizer.transform(texts_clean)
+        tfidf_combined = hstack([word_features, char_features], format='csr')
+        self.svd = TruncatedSVD(
+            n_components=min(self.spec.svd_dim, tfidf_combined.shape[1] - 1),
+            random_state=self.spec.random_state
+        )
+        tfidf_reduced = self.svd.fit_transform(tfidf_combined)
+        self.scaler = StandardScaler(with_mean=True)
+        _ = self.scaler.fit_transform(tfidf_reduced)
+
         if self.spec.use_sentiment and SENTIMENT_AVAILABLE:
             self.sentiment_analyzer = SentimentIntensityAnalyzer()
-        
+
         return self
     
     def transform(self, texts: pd.Series) -> Dict[str, np.ndarray]:
@@ -295,21 +303,10 @@ class RobustFeatureEngineer:
         char_features = self.char_vectorizer.transform(texts_clean)
         
         tfidf_combined = hstack([word_features, char_features], format='csr')
-        
-        if self.svd is None:
-            self.svd = TruncatedSVD(
-                n_components=min(self.spec.svd_dim, tfidf_combined.shape[1] - 1),
-                random_state=self.spec.random_state
-            )
-            tfidf_reduced = self.svd.fit_transform(tfidf_combined)
+        # Transform only (fit happened in fit())
+        tfidf_reduced = self.svd.transform(tfidf_combined)
+        tfidf_reduced = self.scaler.transform(tfidf_reduced)
 
-            # SVD output is dense; mean-centering improves downstream linear models.
-            self.scaler = StandardScaler(with_mean=True)
-            tfidf_reduced = self.scaler.fit_transform(tfidf_reduced)
-        else:
-            tfidf_reduced = self.svd.transform(tfidf_combined)
-            tfidf_reduced = self.scaler.transform(tfidf_reduced)
-        
         features['sparse_reduced'] = csr_matrix(tfidf_reduced)
         features['svd_reduced'] = features['sparse_reduced']
         
@@ -472,18 +469,24 @@ class TransformerBackbone:
             return
 
         from torch.utils.data import DataLoader, TensorDataset
+        from sklearn.model_selection import train_test_split
 
         labels_array = np.array(labels)
         texts_array = texts.to_numpy() if hasattr(texts, "to_numpy") else np.array(list(texts))
 
         if val_texts is None or val_labels is None:
-            if len(labels_array) > 1:
-                cut = max(1, int((1.0 - self.spec.transformer_val_fraction) * len(labels_array)))
-                cut = min(cut, len(labels_array) - 1)
-                train_texts = texts_array[:cut]
-                train_labels = labels_array[:cut]
-                v_texts = texts_array[cut:]
-                v_labels = labels_array[cut:]
+            if len(labels_array) > 1 and len(np.unique(labels_array)) > 1:
+                idx = np.arange(len(labels_array))
+                tr_idx, va_idx = train_test_split(
+                    idx,
+                    test_size=self.spec.transformer_val_fraction,
+                    random_state=self.spec.random_state,
+                    stratify=labels_array,
+                )
+                train_texts = texts_array[tr_idx]
+                train_labels = labels_array[tr_idx]
+                v_texts = texts_array[va_idx]
+                v_labels = labels_array[va_idx]
             else:
                 train_texts = texts_array
                 train_labels = labels_array
@@ -710,7 +713,7 @@ class StackingEnsemble:
             meta_fit_kwargs['sample_weight'] = sample_weight
         self.meta_model.fit(self.oof_predictions, y, **meta_fit_kwargs)
 
-        logger.info("Refitting base models on full data...")
+        logger.info("Refitting base models and calibrating…")
         for name, model in self.base_models.items():
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X_full = self._assemble_features(X_dict, feat_keys)
@@ -720,21 +723,24 @@ class StackingEnsemble:
                 X_full = X_full.toarray()
 
             self._fit_with_sw(model, X_full, y, sw_full)
-
-            calibration_method = cv_splitter.get_calibration_method(len(y))
             from sklearn.model_selection import StratifiedKFold
             skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.spec.random_state)
-            _, cal_idx = next(skf.split(X_full, y))
-            X_cal = X_full[cal_idx]
-            y_cal = y[cal_idx]
+            tr_idx, cal_idx = next(skf.split(X_full, y))
+            X_tr, y_tr = X_full[tr_idx], y[tr_idx]
+            X_cal, y_cal = X_full[cal_idx], y[cal_idx]
+            sw_tr = sw_full[tr_idx] if sw_full is not None else None
             sw_cal = sw_full[cal_idx] if sw_full is not None else None
-            if ADVANCED_MODELS and name == 'catboost' and issparse(X_cal):
-                X_cal = X_cal.toarray()
-            self.calibrators[name] = CalibratedClassifierCV(
-                base_estimator=model,
-                method=calibration_method,
-                cv='prefit'
-            )
+
+            if ADVANCED_MODELS and name == 'catboost':
+                if issparse(X_tr):
+                    X_tr = X_tr.toarray()
+                if issparse(X_cal):
+                    X_cal = X_cal.toarray()
+
+            model_for_cal = clone(model)
+            self._fit_with_sw(model_for_cal, X_tr, y_tr, sw_tr)
+            method = cv_splitter.get_calibration_method(len(y))
+            self.calibrators[name] = CalibratedClassifierCV(base_estimator=model_for_cal, method=method, cv='prefit')
             if sw_cal is not None:
                 self.calibrators[name].fit(X_cal, y_cal, sample_weight=sw_cal)
             else:
@@ -779,7 +785,7 @@ class HierarchicalRouter:
         ], format='csr')
         
         self.rule_classifier.fit(X_combined, rules)
-        self.rule_classes_ = self.rule_classifier.classes_
+        self.rule_classes_ = self.rule_classifier.classes_  # set once; no need to re-check later
         
         unique_rules = np.unique(rules)
         for rule in unique_rules:
@@ -823,7 +829,7 @@ class HierarchicalRouter:
         
         rule_probs = self.rule_classifier.predict_proba(X_combined)
 
-        classes = self.rule_classes_ if self.rule_classes_ is not None else self.rule_classifier.classes_
+        classes = self.rule_classes_
         top_k = getattr(self.spec, "hierarchical_top_k", 3)
 
         for i in range(n_samples):
@@ -910,14 +916,11 @@ class ProductionPipeline:
             n_train = min(self.spec.adv_val_max_train, X_train.shape[0])
             n_test = min(self.spec.adv_val_max_train, X_test.shape[0])
 
-            if hasattr(X_train, 'toarray'):
-                X_train_sample = X_train[:n_train].toarray()
-                X_test_sample = X_test[:n_test].toarray()
-            else:
-                X_train_sample = X_train[:n_train]
-                X_test_sample = X_test[:n_test]
-            
-            X_combined = np.vstack([X_train_sample, X_test_sample])
+            X_train_sample = X_train[:n_train]
+            X_test_sample = X_test[:n_test]
+
+            from scipy.sparse import vstack as sp_vstack
+            X_combined = sp_vstack([X_train_sample, X_test_sample]) if issparse(X_train_sample) else np.vstack([X_train_sample, X_test_sample])
             y_combined = np.concatenate([
                 np.zeros(n_train),
                 np.ones(n_test)
@@ -964,14 +967,15 @@ class ProductionPipeline:
     
     def _combine_features(self, X_dict):
         features = []
-        
+
         if 'sparse_reduced' in X_dict:
             features.append(X_dict['sparse_reduced'])
-        
+
         for key in ['meta', 'topic', 'sentiment', 'pos']:
             if key in X_dict:
-                features.append(csr_matrix(X_dict[key]))
-        
+                arr = X_dict[key]
+                features.append(arr if issparse(arr) else csr_matrix(arr))
+
         return hstack(features, format='csr')
     
     def train_with_curriculum(self, X_dict, y):
@@ -1177,7 +1181,7 @@ class ProductionPipeline:
                 X_aug_dict[key] = features[aug_idx]
             else:
                 augmented = features[aug_idx].copy()
-                noise = np.random.normal(0, 0.01, augmented.shape)
+                noise = np.random.normal(0, self.spec.augmentation_noise_std, augmented.shape)
                 X_aug_dict[key] = augmented + noise
         
         for key in X_dict.keys():
@@ -1264,6 +1268,8 @@ class ProductionPipeline:
         logger.warning("SECURITY: joblib uses pickle. Only load bundle.joblib from trusted sources.")
 
 def main():
+    # set seeds at runtime (avoids side effects on import)
+    set_all_seeds(42)
     spec = TrainSpec()
 
     logger.info("Loading data…")
