@@ -446,24 +446,39 @@ class TransformerBackbone:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = None
-        
+        self.ready = False
+
     def setup(self, n_labels=2, multi_task=False):
         if not TRANSFORMERS_AVAILABLE:
             return None
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(self.spec.transformer_model)
-        
-        if self.mode == 'fine_tune':
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                self.spec.transformer_model,
-                num_labels=n_labels
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.spec.transformer_model)
+
+            if self.mode == 'fine_tune':
+                self.model = AutoModelForSequenceClassification.from_pretrained(
+                    self.spec.transformer_model,
+                    num_labels=n_labels
+                )
+            else:
+                self.model = AutoModel.from_pretrained(self.spec.transformer_model)
+        except (OSError, EnvironmentError) as exc:
+            logger.warning(
+                "Transformer backbone unavailable (%s); continuing without transformer features.",
+                exc
             )
-        else:
-            self.model = AutoModel.from_pretrained(self.spec.transformer_model)
-        
+            self.model = None
+            self.tokenizer = None
+            self.ready = False
+            return None
+
         self.model.to(self.device)
+        self.ready = True
         return self
-    
+
+    def is_ready(self):
+        return self.ready and self.model is not None and self.tokenizer is not None
+
     def fine_tune(self, texts, labels, val_texts=None, val_labels=None):
         if self.mode != 'fine_tune' or not TRANSFORMERS_AVAILABLE:
             return
@@ -578,9 +593,9 @@ class TransformerBackbone:
             self.model.load_state_dict(best_state)
     
     def get_embeddings(self, texts):
-        if not TRANSFORMERS_AVAILABLE:
+        if not TRANSFORMERS_AVAILABLE or not self.is_ready():
             return None
-        
+
         self.model.eval()
         embeddings = []
         
@@ -1043,9 +1058,13 @@ class ProductionPipeline:
             self.transformer = TransformerBackbone(self.spec, mode='embed_only')
             self.transformer.setup()
 
-            embeddings = self.transformer.get_embeddings(train_text)
-            if embeddings is not None:
-                X_train_dict['transformer'] = embeddings
+            if not self.transformer.is_ready():
+                logger.info("Transformer backbone disabled; proceeding without transformer features.")
+                self.transformer = None
+            else:
+                embeddings = self.transformer.get_embeddings(train_text)
+                if embeddings is not None:
+                    X_train_dict['transformer'] = embeddings
 
         if self.spec.use_curriculum:
             self.train_with_curriculum(X_train_dict, y_train)
@@ -1090,7 +1109,7 @@ class ProductionPipeline:
         test_text = self._compose_texts(test_df)
         X_test_dict = self.feature_engineer.transform(test_text)
         
-        if self.transformer:
+        if self.transformer and self.transformer.is_ready():
             embeddings = self.transformer.get_embeddings(test_text)
             if embeddings is not None:
                 X_test_dict['transformer'] = embeddings
