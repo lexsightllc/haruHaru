@@ -38,23 +38,25 @@ from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
 import lightgbm as lgb
+# Advanced models import: clear, non-redundant, and PEP 8 friendly
+ADVANCED_MODELS = True
+missing = []
 try:
-    from catboost import CatBoostClassifier, Pool as CBPool
-    ADVANCED_MODELS = True
-except ImportError:
+    import xgboost as xgb  # noqa: F401
+except Exception:
+    missing.append("XGBoost")
+try:
+    from catboost import CatBoostClassifier
+except Exception:
+    missing.append("CatBoost")
+try:
+    from catboost import Pool as CBPool
+except Exception:
+    if "CatBoost" not in missing:
+        missing.append("CatBoost Pool")
+if missing:
     ADVANCED_MODELS = False
-    missing = []
-    try:
-        import xgboost  # noqa: F401
-    except Exception:
-        missing.append("XGBoost")
-    try:
-        from catboost import CatBoostClassifier  # noqa: F401
-    except Exception:
-        missing.append("CatBoost")
-    if not missing:
-        missing.append("XGBoost/CatBoost")
-    logger.info(f"Advanced models not available: {', '.join(missing)}")
+    logger.info("Advanced models not available: %s", ", ".join(missing))
 
 try:
     from textblob import TextBlob
@@ -693,12 +695,12 @@ class StackingEnsemble:
 
     @staticmethod
     def _fit_with_sw(model, X, y, sw):
-        """Fit with sample_weight if supported; avoid masking other TypeErrors."""
-        from inspect import signature
-        sig = signature(model.fit)
-        if 'sample_weight' in sig.parameters and sw is not None:
-            return model.fit(X, y, sample_weight=sw)
-        return model.fit(X, y)
+        """Fit model with optional sample weights and return the fitted instance."""
+        try:
+            model.fit(X, y, sample_weight=sw)
+        except TypeError:
+            model.fit(X, y)
+        return model
 
     def fit(self, X_dict, y, cv_splitter, groups=None, sample_weight=None):
         n_samples = len(y)
@@ -772,16 +774,20 @@ class StackingEnsemble:
                     ),
                     verbose=False,
                 )
-                Xcal_for_fit = CBPool(X_cal)
+                Xcal_for_fit = X_cal
             else:
-                self._fit_with_sw(model_for_cal, X_tr, y_tr, sw_tr)
+                model_for_cal = self._fit_with_sw(model_for_cal, X_tr, y_tr, sw_tr)
                 Xcal_for_fit = X_cal
             method = cv_splitter.get_calibration_method(len(y))
-            self.calibrators[name] = CalibratedClassifierCV(base_estimator=model_for_cal, method=method, cv='prefit')
+            try:
+                calibrator = CalibratedClassifierCV(estimator=model_for_cal, method=method, cv='prefit')
+            except TypeError:
+                calibrator = CalibratedClassifierCV(base_estimator=model_for_cal, method=method, cv='prefit')
+            fit_kwargs = {}
             if sw_cal is not None:
-                self.calibrators[name].fit(Xcal_for_fit, y_cal, sample_weight=sw_cal)
-            else:
-                self.calibrators[name].fit(Xcal_for_fit, y_cal)
+                fit_kwargs['sample_weight'] = sw_cal
+            calibrator.fit(Xcal_for_fit, y_cal, **fit_kwargs)
+            self.calibrators[name] = calibrator
 
         return self
 
@@ -792,10 +798,7 @@ class StackingEnsemble:
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X = self._assemble_features(X_dict, feat_keys)
 
-            if ADVANCED_MODELS and name == 'catboost':
-                pred = self.calibrators[name].predict_proba(CBPool(X))[:, 1]
-            else:
-                pred = self.calibrators[name].predict_proba(X)[:, 1]
+            pred = self.calibrators[name].predict_proba(X)[:, 1]
             predictions.append(pred)
 
         stacked = np.column_stack(predictions)
@@ -939,6 +942,7 @@ class ProductionPipeline:
         self.hierarchical = None
         self.gate = None
         self.transformer = None
+        self._train_texts = None
         self.adversarial_weights = None
         self.drift_monitor = {}
         self.model_bundle = {}
@@ -1038,13 +1042,21 @@ class ProductionPipeline:
         
         sorted_idx = np.argsort(difficulties)
         
-        if self.spec.use_transformer and self.transformer and getattr(self.transformer, "mode", "") == "fine_tune":
+        if (
+            self.spec.use_transformer
+            and self.transformer
+            and getattr(self.transformer, "mode", "") == "fine_tune"
+            and hasattr(self, "_train_texts")
+        ):
             for fraction, epochs in self.spec.curriculum_stages:
                 end_idx = int(fraction * len(sorted_idx))
                 stage_idx = sorted_idx[:end_idx]
-
                 logger.info("  Transformer stage: %.0f%% (%d samples, %d epochs)", fraction * 100, len(stage_idx), epochs)
                 self.transformer.spec.transformer_epochs = epochs
+                self.transformer.fine_tune(
+                    self._train_texts.iloc[stage_idx],
+                    y[stage_idx]
+                )
     
     def fit(self, train_df: pd.DataFrame, test_df: pd.DataFrame = None):
         logger.info("=" * 60)
@@ -1066,6 +1078,7 @@ class ProductionPipeline:
 
         logger.info("Feature Engineering…")
         train_text = self._compose_texts(train_df)
+        self._train_texts = train_text
         self.feature_engineer.fit(train_text, y_train)
 
         X_train_dict = self.feature_engineer.transform(train_text)
