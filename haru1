@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
-# NOTE: This is a Python script (not JavaScript). Shebang and imports below
-# make this explicit; reviews and tooling should treat it as Python code.
+# NOTE: This is a Python script (not JavaScript). Reviews/tooling should treat it as Python.
 
 import os
-import sys
+# import sys  # unused
 
 # Disable debugger warnings
 os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
-# Suppress warnings early
 import warnings
-# Prefer targeted filtering instead of blanket suppression. Configure
-# filter rules near noisy call sites if needed, e.g.:
-# warnings.filterwarnings("ignore", category=DeprecationWarning, module="module.name")
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("pipeline")
 
 import gc
 import json
 import hashlib
-import pickle
+# import pickle  # joblib handles serialization internally; avoid importing pickle directly
 import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -36,15 +34,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD, NMF
 from sklearn.linear_model import LogisticRegression, SGDClassifier
-from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
+from sklearn.metrics import roc_auc_score, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.isotonic import IsotonicRegression
-from sklearn.base import clone, BaseEstimator, TransformerMixin
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.base import clone
 
 import lightgbm as lgb
 try:
-    import xgboost as xgb
     from catboost import CatBoostClassifier
     ADVANCED_MODELS = True
 except ImportError:
@@ -60,7 +55,7 @@ except ImportError:
         missing.append("CatBoost")
     if not missing:
         missing.append("XGBoost/CatBoost")
-    print(f"Advanced models not available: {', '.join(missing)}")
+    logger.info(f"Advanced models not available: {', '.join(missing)}")
 
 try:
     from textblob import TextBlob
@@ -104,7 +99,7 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
-    print("Transformers not available")
+    logger.info("Transformers not available")
 
 def set_all_seeds(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -113,6 +108,7 @@ def set_all_seeds(seed=42):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
+# For library use, prefer calling set_all_seeds() from main(). Left here for script use:
 set_all_seeds(42)
 
 @dataclass
@@ -139,18 +135,24 @@ class TrainSpec:
     use_borderline_gate: bool = True
     # Router/gate and curriculum knobs
     hierarchical_top_k: int = 3
+    hier_expert_min_samples: int = 50
     borderline_low: float = 0.4
     borderline_high: float = 0.6
     entropy_threshold: float = 0.5
     transformer_epochs: int = 3
+    transformer_max_length: int = 512
+    transformer_patience: int = 2
+    transformer_val_fraction: float = 0.1
     curriculum_stages: Tuple[Tuple[float, int], ...] = ((0.33, 5), (0.67, 3), (1.0, 2))
     pos_max_chars: int = 500
+    pos_tags: Tuple[str, ...] = ("NN", "VB", "JJ", "RB")
 
     use_curriculum: bool = True
     use_pseudo_labeling: bool = False
     use_adversarial_validation: bool = True
     use_augmentation: bool = True
     augmentation_ratio: float = 0.2
+    augmentation_max: int = 200
     
     calibration_mode: str = "sigmoid"
     min_samples_isotonic: int = 300
@@ -166,6 +168,11 @@ class TrainSpec:
     memory_limit_mb: int = 30000
     n_jobs: int = -1
     batch_size: int = 32
+    # Adversarial validation sampling caps
+    adv_val_max_train: int = 5000
+    adv_val_max_all: int = 10000
+    # CatBoost feature toggle
+    catboost_use_svd: bool = False
 
 class CrossValidator:
     def __init__(self, spec: TrainSpec):
@@ -180,9 +187,14 @@ class CrossValidator:
             random_state=self.spec.random_state
         )
         
-        if groups is not None and len(np.unique(groups)) >= self.spec.cv_folds:
-            self.group_splitter = GroupKFold(n_splits=self.spec.cv_folds)
-            print(f"Using GroupKFold guardrail with {len(np.unique(groups))} groups")
+        if groups is not None and len(np.unique(groups)) >= 2:
+            n_splits = min(self.spec.cv_folds, len(np.unique(groups)))
+            try:
+                self.group_splitter = GroupKFold(n_splits=n_splits)
+                logger.info(f"Using GroupKFold with {len(np.unique(groups))} groups and {n_splits} splits")
+            except ValueError as e:
+                logger.warning(f"GroupKFold unavailable ({e}); falling back to StratifiedKFold")
+                self.group_splitter = None
         
     def split(self, X, y, groups=None):
         if self.group_splitter and groups is not None:
@@ -196,6 +208,7 @@ class CrossValidator:
         return self.spec.calibration_mode
 
 class RobustFeatureEngineer:
+    """Builds TF-IDF + char n-grams, SVD projection, topic NMF, and meta/sentiment/POS features."""
     def __init__(self, spec: TrainSpec):
         self.spec = spec
         self.word_vectorizer = None
@@ -208,7 +221,7 @@ class RobustFeatureEngineer:
         self.sentiment_analyzer = None
         
     def fit(self, texts: pd.Series, y: np.ndarray = None):
-        print("Fitting feature transformers...")
+        logger.info("Fitting feature transformers…")
         
         texts_clean = texts.apply(self._clean_text)
         
@@ -280,6 +293,7 @@ class RobustFeatureEngineer:
             tfidf_reduced = self.scaler.transform(tfidf_reduced)
         
         features['sparse_reduced'] = csr_matrix(tfidf_reduced)
+        features['svd_reduced'] = features['sparse_reduced']
         
         topic_matrix = self.topic_vectorizer.transform(texts_clean)
         topic_features = self.topic_model.transform(topic_matrix)
@@ -391,19 +405,14 @@ class RobustFeatureEngineer:
                         for _, tag in pos_tags:
                             category = tag[:2]
                             pos_counts[category] = pos_counts.get(category, 0) + 1
-                        
+
                         total = len(pos_tags) + 1
-                        feature_vec = [
-                            pos_counts.get('NN', 0) / total,
-                            pos_counts.get('VB', 0) / total,
-                            pos_counts.get('JJ', 0) / total,
-                            pos_counts.get('RB', 0) / total,
-                        ] + [0.0]
-                        # Vector is five-dimensional; last slot flags missing POS context.
+                        buckets = [pos_counts.get(tag, 0) / total for tag in self.spec.pos_tags]
+                        feature_vec = buckets + [0.0]
                     except (LookupError, nltk.NLTKError):
-                        feature_vec = [0.0, 0.0, 0.0, 0.0, 1.0]
+                        feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
                 else:
-                    feature_vec = [0.0, 0.0, 0.0, 0.0, 1.0]
+                    feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
                 
                 self.pos_cache[text_hash] = feature_vec
             
@@ -412,6 +421,7 @@ class RobustFeatureEngineer:
         return np.array(features, dtype=np.float32)
 
 class TransformerBackbone:
+    """Optional transformer backbone for fine-tuning or embedding extraction."""
     def __init__(self, spec: TrainSpec, mode='fine_tune'):
         self.spec = spec
         self.mode = mode
@@ -442,29 +452,52 @@ class TransformerBackbone:
     def fine_tune(self, texts, labels, val_texts=None, val_labels=None):
         if self.mode != 'fine_tune' or not TRANSFORMERS_AVAILABLE:
             return
-        
+
         from torch.utils.data import DataLoader, TensorDataset
-        
+
+        labels_array = np.array(labels)
+        texts_array = texts.to_numpy() if hasattr(texts, "to_numpy") else np.array(list(texts))
+
+        if val_texts is None or val_labels is None:
+            if len(labels_array) > 1:
+                cut = max(1, int((1.0 - self.spec.transformer_val_fraction) * len(labels_array)))
+                cut = min(cut, len(labels_array) - 1)
+                train_texts = texts_array[:cut]
+                train_labels = labels_array[:cut]
+                v_texts = texts_array[cut:]
+                v_labels = labels_array[cut:]
+            else:
+                train_texts = texts_array
+                train_labels = labels_array
+                v_texts = None
+                v_labels = None
+        else:
+            train_texts = texts_array
+            train_labels = labels_array
+            v_texts = val_texts.to_numpy() if hasattr(val_texts, "to_numpy") else np.array(list(val_texts))
+            v_labels = np.array(val_labels)
+
+        max_len = self.spec.transformer_max_length
         train_encodings = self.tokenizer(
-            texts.tolist(),
+            train_texts.tolist(),
             truncation=True,
             padding=True,
-            max_length=512,
+            max_length=max_len,
             return_tensors='pt'
         )
-        
+
         train_dataset = TensorDataset(
             train_encodings['input_ids'],
             train_encodings['attention_mask'],
-            torch.tensor(labels)
+            torch.tensor(train_labels)
         )
-        
+
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.spec.batch_size,
             shuffle=True
         )
-        
+
         optimizer = AdamW(self.model.parameters(), lr=2e-5)
         total_steps = len(train_loader) * self.spec.transformer_epochs
         scheduler = get_linear_schedule_with_warmup(
@@ -473,6 +506,9 @@ class TransformerBackbone:
             num_training_steps=total_steps
         )
 
+        best_state = None
+        best_val = float("inf")
+        bad = 0
         self.model.train()
         for epoch in range(self.spec.transformer_epochs):
             for batch in train_loader:
@@ -489,6 +525,36 @@ class TransformerBackbone:
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
+
+            if v_texts is not None and len(v_texts) > 0:
+                self.model.eval()
+                with torch.no_grad():
+                    v_enc = self.tokenizer(
+                        v_texts.tolist(),
+                        truncation=True,
+                        padding=True,
+                        max_length=max_len,
+                        return_tensors='pt'
+                    ).to(self.device)
+                    v_outputs = self.model(
+                        **v_enc,
+                        labels=torch.tensor(v_labels).to(self.device)
+                    )
+                    v_loss = float(v_outputs.loss.detach().cpu().item())
+                self.model.train()
+                logger.info(f"Transformer epoch {epoch + 1}: val_loss={v_loss:.4f}")
+                if v_loss + 1e-6 < best_val:
+                    best_val = v_loss
+                    bad = 0
+                    best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                else:
+                    bad += 1
+                    if bad >= self.spec.transformer_patience:
+                        logger.info("Early stopping transformer fine-tune.")
+                        break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
     
     def get_embeddings(self, texts):
         if not TRANSFORMERS_AVAILABLE:
@@ -505,7 +571,7 @@ class TransformerBackbone:
                     batch_texts,
                     truncation=True,
                     padding=True,
-                    max_length=512,
+                    max_length=self.spec.transformer_max_length,
                     return_tensors='pt'
                 ).to(self.device)
                 
@@ -571,7 +637,9 @@ class StackingEnsemble:
             'lgbm_sparse': ['sparse_reduced'],
         }
         if ADVANCED_MODELS:
-            self.model_features['catboost'] = ['meta', 'topic']
+            self.model_features['catboost'] = (
+                ['sparse_reduced', 'meta', 'topic'] if self.spec.catboost_use_svd else ['meta', 'topic']
+            )
 
     def _assemble_features(self, X_dict, feat_keys):
         """Safely stack model features, preserving sparsity if needed."""
@@ -584,6 +652,15 @@ class StackingEnsemble:
             return hstack(arrays, format='csr')
         return np.hstack(arrays)
 
+    @staticmethod
+    def _fit_with_sw(model, X, y, sw):
+        """Fit with sample_weight if supported; avoid masking other TypeErrors."""
+        from inspect import signature
+        sig = signature(model.fit)
+        if 'sample_weight' in sig.parameters and sw is not None:
+            return model.fit(X, y, sample_weight=sw)
+        return model.fit(X, y)
+
     def fit(self, X_dict, y, cv_splitter, groups=None, sample_weight=None):
         n_samples = len(y)
         n_models = len(self.base_models)
@@ -591,7 +668,7 @@ class StackingEnsemble:
         self.oof_predictions = np.zeros((n_samples, n_models))
 
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_dict['sparse_reduced'], y, groups)):
-            print(f"Generating OOF for fold {fold_idx + 1}")
+            logger.info(f"Generating OOF for fold {fold_idx + 1}")
 
             for model_idx, (name, model) in enumerate(self.base_models.items()):
                 feat_keys = self.model_features.get(name, ['sparse_reduced'])
@@ -601,10 +678,10 @@ class StackingEnsemble:
 
                 model_clone = clone(model)
                 sw = sample_weight[train_idx] if sample_weight is not None else None
-                try:
-                    model_clone.fit(X_train, y[train_idx], sample_weight=sw)
-                except TypeError:
-                    model_clone.fit(X_train, y[train_idx])
+                if ADVANCED_MODELS and name == 'catboost' and issparse(X_train):
+                    X_train = X_train.toarray()
+                    X_val = X_val.toarray()
+                self._fit_with_sw(model_clone, X_train, y[train_idx], sw)
                 pred = model_clone.predict_proba(X_val)[:, 1]
 
                 self.oof_predictions[val_idx, model_idx] = pred
@@ -615,27 +692,35 @@ class StackingEnsemble:
             meta_fit_kwargs['sample_weight'] = sample_weight
         self.meta_model.fit(self.oof_predictions, y, **meta_fit_kwargs)
 
-        print("Refitting base models on full data...")
+        logger.info("Refitting base models on full data...")
         for name, model in self.base_models.items():
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X_full = self._assemble_features(X_dict, feat_keys)
 
             sw_full = sample_weight if sample_weight is not None else None
-            try:
-                model.fit(X_full, y, sample_weight=sw_full)
-            except TypeError:
-                model.fit(X_full, y)
+            if ADVANCED_MODELS and name == 'catboost' and issparse(X_full):
+                X_full = X_full.toarray()
+
+            self._fit_with_sw(model, X_full, y, sw_full)
 
             calibration_method = cv_splitter.get_calibration_method(len(y))
+            from sklearn.model_selection import StratifiedKFold
+            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.spec.random_state)
+            _, cal_idx = next(skf.split(X_full, y))
+            X_cal = X_full[cal_idx]
+            y_cal = y[cal_idx]
+            sw_cal = sw_full[cal_idx] if sw_full is not None else None
+            if ADVANCED_MODELS and name == 'catboost' and issparse(X_cal):
+                X_cal = X_cal.toarray()
             self.calibrators[name] = CalibratedClassifierCV(
                 base_estimator=model,
                 method=calibration_method,
-                cv=5
+                cv='prefit'
             )
-            calibrator_fit_kwargs = {}
-            if sw_full is not None:
-                calibrator_fit_kwargs['sample_weight'] = sw_full
-            self.calibrators[name].fit(X_full, y, **calibrator_fit_kwargs)
+            if sw_cal is not None:
+                self.calibrators[name].fit(X_cal, y_cal, sample_weight=sw_cal)
+            else:
+                self.calibrators[name].fit(X_cal, y_cal)
 
         return self
 
@@ -646,6 +731,8 @@ class StackingEnsemble:
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X = self._assemble_features(X_dict, feat_keys)
 
+            if ADVANCED_MODELS and name == 'catboost' and issparse(X):
+                X = X.toarray()
             pred = self.calibrators[name].predict_proba(X)[:, 1]
             predictions.append(pred)
 
@@ -679,7 +766,7 @@ class HierarchicalRouter:
         unique_rules = np.unique(rules)
         for rule in unique_rules:
             mask = rules == rule
-            if mask.sum() >= 50:
+            if mask.sum() >= self.spec.hier_expert_min_samples:
                 X_rule = X_combined[mask]
                 y_rule = y[mask]
                 
@@ -791,20 +878,20 @@ class ProductionPipeline:
         self.model_bundle = {}
         
     def run_adversarial_validation(self, X_train_dict, X_test_dict):
-        print("\nAdversarial Validation:")
-        
+        logger.info("Adversarial Validation:")
+
         adv_scores = {}
-        
+
         for feat_name in ['sparse_reduced', 'meta', 'topic']:
             if feat_name not in X_train_dict:
                 continue
-                
+
             X_train = X_train_dict[feat_name]
             X_test = X_test_dict[feat_name]
-            
-            n_train = min(5000, X_train.shape[0])
-            n_test = min(5000, X_test.shape[0])
-            
+
+            n_train = min(self.spec.adv_val_max_train, X_train.shape[0])
+            n_test = min(self.spec.adv_val_max_train, X_test.shape[0])
+
             if hasattr(X_train, 'toarray'):
                 X_train_sample = X_train[:n_train].toarray()
                 X_test_sample = X_test[:n_test].toarray()
@@ -823,33 +910,37 @@ class ProductionPipeline:
                 random_state=self.spec.random_state,
                 verbosity=-1
             )
-            
+
             from sklearn.model_selection import cross_val_score
             scores = cross_val_score(clf, X_combined, y_combined, cv=3, scoring='roc_auc')
             adv_scores[feat_name] = scores.mean()
-            
-            print(f"  {feat_name}: AUC = {scores.mean():.3f}")
-        
+
+            logger.info(f"  {feat_name}: AUC = {scores.mean():.3f}")
+
+        if not adv_scores:
+            self.adversarial_weights = None
+            return
+
         max_score = max(adv_scores.values())
         if max_score > 0.7:
-            print(f"  Distribution shift detected (max AUC = {max_score:.3f})")
-            
+            logger.info(f"  Distribution shift detected (max AUC = {max_score:.3f})")
+
             X_train_all = self._combine_features(X_train_dict)
             X_test_all = self._combine_features(X_test_dict)
-            
-            n_train = min(10000, X_train_all.shape[0])
-            n_test = min(10000, X_test_all.shape[0])
-            
+
+            n_train = min(self.spec.adv_val_max_all, X_train_all.shape[0])
+            n_test = min(self.spec.adv_val_max_all, X_test_all.shape[0])
+
             X_combined = vstack([X_train_all[:n_train], X_test_all[:n_test]])
             y_combined = np.concatenate([np.zeros(n_train), np.ones(n_test)])
-            
+
             clf.fit(X_combined, y_combined)
-            
+
             train_probs = clf.predict_proba(X_train_all)[:, 1]
             self.adversarial_weights = (1 - train_probs) / (train_probs + 1e-10)
             self.adversarial_weights = np.clip(self.adversarial_weights, 0.1, 10)
-            
-            print(f"  Applied importance weights: mean={self.adversarial_weights.mean():.2f}")
+
+            logger.info(f"  Applied importance weights: mean={self.adversarial_weights.mean():.2f}")
         else:
             self.adversarial_weights = None
     
@@ -869,7 +960,7 @@ class ProductionPipeline:
         if not self.spec.use_curriculum:
             return None
         
-        print("\nCurriculum Learning:")
+        logger.info("Curriculum Learning:")
         
         simple_model = LogisticRegression(
             max_iter=100,
@@ -888,52 +979,57 @@ class ProductionPipeline:
                 end_idx = int(fraction * len(sorted_idx))
                 stage_idx = sorted_idx[:end_idx]
 
-                print(f"  Stage: {fraction:.0%} of data ({len(stage_idx)} samples)")
+                logger.info(f"  Stage: {fraction:.0%} of data ({len(stage_idx)} samples)")
                 # TODO: integrate stage-specific fine-tuning once transformer training is enabled
     
     def fit(self, train_df: pd.DataFrame, test_df: pd.DataFrame = None):
-        print("="*60)
-        print("PRODUCTION PIPELINE")
-        print("="*60)
-        
+        logger.info("=" * 60)
+        logger.info("PRODUCTION PIPELINE")
+        logger.info("=" * 60)
+
         tracemalloc.start()
-        
+
         y_train = train_df['rule_violation'].values
-        groups = train_df.get('subreddit', train_df.get('rule')).values
+        if 'subreddit' in train_df.columns:
+            groups = train_df['subreddit'].values
+        elif 'rule' in train_df.columns:
+            groups = train_df['rule'].values
+        else:
+            groups = None
         rules = train_df['rule'].values if 'rule' in train_df.columns else None
-        
+
         self.cv.setup(y_train, groups)
-        
-        print("\nFeature Engineering:")
+
+        logger.info("Feature Engineering…")
         train_text = self._compose_texts(train_df)
         self.feature_engineer.fit(train_text, y_train)
-        
+
         X_train_dict = self.feature_engineer.transform(train_text)
-        
+
         if test_df is not None:
             test_text = self._compose_texts(test_df)
             X_test_dict = self.feature_engineer.transform(test_text)
-            
+
             if self.spec.use_adversarial_validation:
                 self.run_adversarial_validation(X_train_dict, X_test_dict)
-        
+
         if self.spec.use_augmentation:
             X_train_dict, y_train, groups, rules = self._augment_data(X_train_dict, y_train, train_df, groups, rules)
 
         if self.spec.use_transformer:
-            print("\nSetting up Transformer:")
+            logger.info("Setting up Transformer backbone…")
             self.transformer = TransformerBackbone(self.spec, mode='embed_only')
             self.transformer.setup()
-            
+
             embeddings = self.transformer.get_embeddings(train_text)
             if embeddings is not None:
                 X_train_dict['transformer'] = embeddings
-        
+
         if self.spec.use_curriculum:
             self.train_with_curriculum(X_train_dict, y_train)
-        
+
         if self.spec.use_stacking:
-            print("\nTraining Stacking Ensemble:")
+            logger.info("Training Stacking Ensemble…")
             self.stacker = StackingEnsemble(self.spec)
             self.stacker.setup_models(X_train_dict['sparse_reduced'].shape)
             self.stacker.fit(
@@ -943,29 +1039,29 @@ class ProductionPipeline:
                 groups,
                 sample_weight=self.adversarial_weights
             )
-            
+
             self.model_bundle['oof_predictions'] = self.stacker.oof_predictions
-        
+
         if self.spec.use_hierarchical and rules is not None:
-            print("\nTraining Hierarchical Router:")
+            logger.info("Training Hierarchical Router…")
             self.hierarchical = HierarchicalRouter(self.spec)
             self.hierarchical.fit(X_train_dict, y_train, rules)
-        
+
         if self.spec.use_borderline_gate:
-            print("\nTraining Borderline Gate:")
+            logger.info("Training Borderline Gate…")
             self.gate = BorderlineGate(self.spec)
             self.gate.fit(X_train_dict, y_train, sample_weight=self.adversarial_weights)
-        
+
         self._setup_drift_monitor(X_train_dict, y_train)
-        
+
         self._run_error_analysis(X_train_dict, y_train, groups)
-        
+
         self._save_model_bundle()
-        
+
         current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-        print(f"\nMemory: Current={current/1024/1024:.1f}MB, Peak={peak/1024/1024:.1f}MB")
-        
+        logger.info(f"Memory: Current={current/1024/1024:.1f}MB, Peak={peak/1024/1024:.1f}MB")
+
         return self
     
     def predict(self, test_df: pd.DataFrame, return_all_scores=False):
@@ -994,6 +1090,8 @@ class ProductionPipeline:
             for name, _ in self.stacker.base_models.items():
                 feat_keys = self.stacker.model_features.get(name, ['sparse_reduced'])
                 X = self.stacker._assemble_features(X_test_dict, feat_keys)
+                if ADVANCED_MODELS and name == 'catboost' and issparse(X):
+                    X = X.toarray()
                 pred = self.stacker.calibrators[name].predict_proba(X)[:, 1]
                 base_preds_list.append(pred)
 
@@ -1013,37 +1111,33 @@ class ProductionPipeline:
         return final_pred
     
     def _compose_texts(self, df):
-        positive_cols = [col for col in df.columns if 'positive_example' in col]
-        negative_cols = [col for col in df.columns if 'negative_example' in col]
+        """Vectorized text composer from columns; avoids Python-level loops."""
+        cols = df.columns
+        empty = pd.Series([''] * len(df))
+        body = df['body'].where(df['body'].notna(), '').astype(str) if 'body' in cols else empty
+        rule = df['rule'].where(df['rule'].notna(), '').astype(str) if 'rule' in cols else empty
+        subr = df['subreddit'].where(df['subreddit'].notna(), '').astype(str) if 'subreddit' in cols else empty
+        base = (
+            ((('[CONTENT] ' + body).where(body != '', '') + ' ').str.strip() + ' ' +
+             (('[RULE] ' + rule).where(rule != '', '') + ' ').str.strip() + ' ' +
+             (('[COMMUNITY] r/' + subr).where(subr != '', '')).str.strip()).str.strip()
+        )
+        pos_cols = [c for c in cols if 'positive_example' in c]
+        neg_cols = [c for c in cols if 'negative_example' in c]
 
-        def compose_row(row):
-            parts = []
+        def fold_examples(series_list, tag):
+            if not series_list:
+                return pd.Series([''] * len(df))
+            s = pd.Series([''] * len(df))
+            for col in series_list:
+                si = df[col].where(df[col].notna(), '').astype(str)
+                s = (s + ' ' + ((f'[{tag}] ' + si).where(si != '', ''))).str.strip()
+            return s
 
-            body = row.get('body')
-            if pd.notna(body):
-                parts.append(f"[CONTENT] {body}")
-
-            rule = row.get('rule')
-            if pd.notna(rule):
-                parts.append(f"[RULE] {rule}")
-
-            subreddit = row.get('subreddit')
-            if pd.notna(subreddit):
-                parts.append(f"[COMMUNITY] r/{subreddit}")
-
-            for col in positive_cols:
-                value = row.get(col)
-                if pd.notna(value):
-                    parts.append(f"[GOOD] {value}")
-
-            for col in negative_cols:
-                value = row.get(col)
-                if pd.notna(value):
-                    parts.append(f"[BAD] {value}")
-
-            return " ".join(parts)
-
-        return df.apply(compose_row, axis=1)
+        good = fold_examples(pos_cols, 'GOOD')
+        bad = fold_examples(neg_cols, 'BAD')
+        texts = (base + ' ' + good + ' ' + bad).str.strip()
+        return texts.fillna('')
     
     def _augment_data(self, X_dict, y, df, groups, rules):
         minority_class = 1 if (y == 1).sum() < (y == 0).sum() else 0
@@ -1053,9 +1147,9 @@ class ProductionPipeline:
             return X_dict, y, groups, rules
         
         n_augment = int(len(minority_idx) * self.spec.augmentation_ratio)
-        n_augment = min(n_augment, 200)
-        
-        print(f"\nAugmenting {n_augment} minority samples")
+        n_augment = min(n_augment, self.spec.augmentation_max)
+
+        logger.info(f"Augmenting {n_augment} minority samples")
         
         aug_idx = np.random.choice(minority_idx, n_augment, replace=True)
         
@@ -1101,7 +1195,7 @@ class ProductionPipeline:
                 self.drift_monitor['feature_means'][key] = features.mean(axis=0)
     
     def _run_error_analysis(self, X_dict, y, groups):
-        print("\nError Analysis:")
+        logger.info("Error Analysis:")
         
         if self.stacker and self.stacker.oof_predictions is not None:
             oof_ensemble = self.stacker.oof_predictions.mean(axis=1)
@@ -1109,14 +1203,14 @@ class ProductionPipeline:
             auc = roc_auc_score(y, oof_ensemble)
             brier = brier_score_loss(y, oof_ensemble)
             
-            print(f"  Overall: AUC={auc:.4f}, Brier={brier:.4f}")
+            logger.info(f"  Overall: AUC={auc:.4f}, Brier={brier:.4f}")
             
             if groups is not None:
                 for rule in np.unique(groups)[:5]:
                     mask = groups == rule
                     if mask.sum() > 10:
                         rule_auc = roc_auc_score(y[mask], oof_ensemble[mask])
-                        print(f"  Rule '{rule}': AUC={rule_auc:.4f}")
+                        logger.info(f"  Rule '{rule}': AUC={rule_auc:.4f}")
     
     def _save_model_bundle(self):
         model_dir = Path(self.spec.model_path)
@@ -1130,7 +1224,6 @@ class ProductionPipeline:
             warnings.warn(f"Joblib not available, skipping bundle persistence: {exc}")
             return
 
-        # SECURITY NOTE: joblib uses pickle; only load this bundle from trusted sources.
         joblib.dump({
             "feature_engineer": self.feature_engineer,
             "stacker": self.stacker,
@@ -1139,32 +1232,41 @@ class ProductionPipeline:
             "transformer_model_name": self.spec.transformer_model if self.transformer else None,
             "drift_monitor": self.drift_monitor,
         }, model_dir / "bundle.joblib")
-
-        print(f"\nModels saved to {model_dir} (config.json, bundle.joblib)")
+        logger.info(f"Models saved to {model_dir} (config.json, bundle.joblib)")
+        if self.transformer and getattr(self.transformer, "model", None):
+            tdir = model_dir / "transformer"
+            tdir.mkdir(exist_ok=True)
+            try:
+                self.transformer.model.save_pretrained(str(tdir))
+                if self.transformer.tokenizer:
+                    self.transformer.tokenizer.save_pretrained(str(tdir))
+                logger.info(f"Transformer saved to {tdir}")
+            except Exception as exc:
+                logger.warning(f"Failed to save transformer: {exc}")
+        logger.warning("SECURITY: joblib uses pickle. Only load bundle.joblib from trusted sources.")
 
 def main():
     spec = TrainSpec()
-    
-    print("Loading data...")
+
+    logger.info("Loading data…")
     train_df = pd.read_csv(spec.train_path)
     test_df = pd.read_csv(spec.test_path)
-    
-    print(f"Train: {train_df.shape}")
-    print(f"Test: {test_df.shape}")
-    
+
+    logger.info(f"Train: {train_df.shape}  Test: {test_df.shape}")
+
     pipeline = ProductionPipeline(spec)
     pipeline.fit(train_df, test_df)
-    
-    print("\nMaking predictions...")
+
+    logger.info("Making predictions…")
     predictions = pipeline.predict(test_df)
-    
+
     submission = pd.DataFrame({
         'row_id': range(len(predictions)),
         'rule_violation': predictions
     })
-    
+
     submission.to_csv("/kaggle/working/submission.csv", index=False)
-    print("\nPipeline complete!")
+    logger.info("Pipeline complete!")
 
 if __name__ == "__main__":
     main()
