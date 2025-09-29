@@ -66,21 +66,39 @@ except ImportError:
 
 import nltk
 NLTK_AVAILABLE = True
+_nltk_error = getattr(nltk, "NLTKError", LookupError)
+_NLTK_FALLBACK_ERRORS = (OSError,)
+if isinstance(_nltk_error, type) and not issubclass(_nltk_error, LookupError):
+    _NLTK_FALLBACK_ERRORS = (OSError, _nltk_error)
+_POS_TAGGER_RESOURCES = (
+    "averaged_perceptron_tagger",
+    "averaged_perceptron_tagger_eng",
+)
 try:
     # Try Kaggle's pre-downloaded path
     nltk.data.path.append('/kaggle/input/nltk-data/')
     # Try to use existing data without downloading
+    nltk.data.find('tokenizers/punkt')
     try:
-        nltk.data.find('tokenizers/punkt')
-        nltk.data.find('taggers/averaged_perceptron_tagger')
+        nltk.data.find('taggers/averaged_perceptron_tagger_eng')
     except LookupError:
-        # Only try download if not in Kaggle
-        if not os.path.exists('/kaggle'):
+        nltk.data.find('taggers/averaged_perceptron_tagger')
+except LookupError as exc:
+    # Only try download if not in Kaggle
+    if not os.path.exists('/kaggle'):
+        try:
             nltk.download('punkt', quiet=True)
-            nltk.download('averaged_perceptron_tagger', quiet=True)
-        else:
+            for resource in _POS_TAGGER_RESOURCES:
+                nltk.download(resource, quiet=True)
+        except Exception as download_exc:  # noqa: BLE001
             NLTK_AVAILABLE = False
-except (LookupError, nltk.NLTKError, OSError) as exc:
+            warnings.warn(
+                "Unable to download NLTK resources: "
+                f"{download_exc} (triggered by {exc})"
+            )
+    else:
+        NLTK_AVAILABLE = False
+except _NLTK_FALLBACK_ERRORS as exc:
     NLTK_AVAILABLE = False
     warnings.warn(f"NLTK resources unavailable: {exc}")
 
@@ -409,7 +427,7 @@ class RobustFeatureEngineer:
                         total = len(pos_tags) + 1
                         buckets = [pos_counts.get(tag, 0) / total for tag in self.spec.pos_tags]
                         feature_vec = buckets + [0.0]
-                    except (LookupError, nltk.NLTKError):
+                    except (LookupError, _nltk_error):
                         feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
                 else:
                     feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
