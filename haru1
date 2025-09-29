@@ -9,7 +9,6 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 import warnings
 import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("pipeline")
 
 import gc
@@ -40,7 +39,7 @@ from sklearn.exceptions import NotFittedError
 
 import lightgbm as lgb
 try:
-    from catboost import CatBoostClassifier
+    from catboost import CatBoostClassifier, Pool as CBPool
     ADVANCED_MODELS = True
 except ImportError:
     ADVANCED_MODELS = False
@@ -65,39 +64,45 @@ except ImportError:
     SENTIMENT_AVAILABLE = False
 
 import nltk
-NLTK_AVAILABLE = True
-_nltk_error = getattr(nltk, "NLTKError", LookupError)
 
-try:
-    # NLTK resource probing & fallback (uses new/old tagger names)
-    nltk.data.path.append('/kaggle/input/nltk-data/')
 
-    def _has_tagger():
-        try:
-            nltk.data.find('taggers/averaged_perceptron_tagger_eng')
-            return True
-        except LookupError:
+def _ensure_nltk_resources() -> bool:
+    """Ensure tokenizer & POS tagger availability across NLTK variants."""
+
+    try:
+        nltk.data.path.append('/kaggle/input/nltk-data/')
+
+        def _has_tagger() -> bool:
             try:
-                nltk.data.find('taggers/averaged_perceptron_tagger')
+                nltk.data.find('taggers/averaged_perceptron_tagger_eng/')
                 return True
             except LookupError:
-                return False
+                try:
+                    nltk.data.find('taggers/averaged_perceptron_tagger/')
+                    return True
+                except LookupError:
+                    return False
 
-    nltk.data.find('tokenizers/punkt')
-    if not _has_tagger():
-        raise LookupError("POS tagger not found")
-except LookupError:
-    if not os.path.exists('/kaggle'):
-        nltk.download('punkt', quiet=True)
         try:
-            nltk.download('averaged_perceptron_tagger_eng', quiet=True)
-        except (URLError, HTTPError, OSError):
-            nltk.download('averaged_perceptron_tagger', quiet=True)
-    else:
-        NLTK_AVAILABLE = False
-except (LookupError, OSError) as exc:
-    NLTK_AVAILABLE = False
-    warnings.warn(f"NLTK resources unavailable: {exc}")
+            nltk.data.find('tokenizers/punkt')
+            if not _has_tagger():
+                raise LookupError("POS tagger not found")
+        except LookupError:
+            if not os.path.exists('/kaggle'):
+                nltk.download('punkt', quiet=True)
+                try:
+                    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+                except (URLError, HTTPError, OSError):
+                    nltk.download('averaged_perceptron_tagger', quiet=True)
+            else:
+                return False
+        return True
+    except (LookupError, OSError) as exc:
+        warnings.warn(f"NLTK resources unavailable: {exc}")
+        return False
+
+
+NLTK_AVAILABLE = _ensure_nltk_resources()
 
 try:
     import optuna
@@ -138,11 +143,12 @@ class TrainSpec:
     max_tfidf_features: int = 30000
     max_char_features: int = 20000
     svd_dim: int = 1024
-    use_sentiment: bool = SENTIMENT_AVAILABLE
+    # Feature toggles express intent; availability is checked at use-time.
+    use_sentiment: bool = True
     use_pos_features: bool = True
     topic_components: int = 20
     
-    use_transformer: bool = TRANSFORMERS_AVAILABLE
+    use_transformer: bool = True
     transformer_model: str = "distilbert-base-uncased"
     use_stacking: bool = True
     use_hierarchical: bool = True
@@ -157,7 +163,10 @@ class TrainSpec:
     transformer_max_length: int = 512
     transformer_patience: int = 2
     transformer_val_fraction: float = 0.1
+    # Analyze per-rule performance; None = all rules
+    error_rules_max: Optional[int] = 20
     curriculum_stages: Tuple[Tuple[float, int], ...] = ((0.33, 5), (0.67, 3), (1.0, 2))
+    # POS tagging truncates to the first N chars for speed; long texts may lose tail context.
     pos_max_chars: int = 500
     pos_tags: Tuple[str, ...] = ("NN", "VB", "JJ", "RB")
 
@@ -309,7 +318,6 @@ class RobustFeatureEngineer:
         tfidf_reduced = self.scaler.transform(tfidf_reduced)
 
         features['sparse_reduced'] = csr_matrix(tfidf_reduced)
-        features['svd_reduced'] = features['sparse_reduced']
         
         topic_matrix = self.topic_vectorizer.transform(texts_clean)
         topic_features = self.topic_model.transform(topic_matrix)
@@ -318,7 +326,7 @@ class RobustFeatureEngineer:
         meta_features = self._extract_meta_features(texts_clean)
         features['meta'] = meta_features
         
-        if self.spec.use_sentiment:
+        if self.spec.use_sentiment and SENTIMENT_AVAILABLE:
             sentiment_features = self._extract_sentiment_features(texts_clean)
             features['sentiment'] = sentiment_features
         
@@ -344,36 +352,29 @@ class RobustFeatureEngineer:
         return text
     
     def _extract_meta_features(self, texts: pd.Series) -> np.ndarray:
-        features = []
-        
-        for text in texts:
-            text = str(text)
-            
-            n_chars = len(text)
-            n_words = len(text.split())
-            n_unique = len(set(text.lower().split()))
-            
-            n_caps = sum(1 for c in text if c.isupper())
-            n_punct = sum(1 for c in text if c in '!?.,:;')
-            n_digits = sum(1 for c in text if c.isdigit())
-            
-            elongations = len(re.findall(r'(.)\1{2,}', text))
-            leetspeak = sum(1 for pair in [('a','@'),('e','3'),('i','!'),('l','1'),('s','$')] 
-                          if pair[1] in text)
-            
-            features.append([
-                np.log1p(n_chars),
-                np.log1p(n_words),
-                np.log1p(n_unique),
-                n_unique / (n_words + 1),
-                n_caps / (n_chars + 1),
-                n_punct / (n_chars + 1),
-                n_digits / (n_chars + 1),
-                np.log1p(elongations),
-                np.log1p(leetspeak)
-            ])
-        
-        return np.array(features, dtype=np.float32)
+        s = texts.astype(str)
+        n_chars = s.str.len().astype(np.float32)
+        n_words = s.str.count(r"\S+").astype(np.float32)
+        n_unique = s.str.lower().str.split().map(lambda xs: len(set(xs))).astype(np.float32)
+        n_caps = s.str.count(r"[A-Z]").astype(np.float32)
+        n_punct = s.str.count(r"[!\?\.,:;]").astype(np.float32)
+        n_digits = s.str.count(r"\d").astype(np.float32)
+        elong = s.str.count(r"(.)\1{2,}").astype(np.float32)
+        leet_pairs = ["@", "3", "!", "1", r"\$"]
+        leet = sum(s.str.contains(p, regex=True).astype(np.float32) for p in leet_pairs)
+        denom_words = n_words + 1.0
+        features = np.column_stack([
+            np.log1p(n_chars),
+            np.log1p(n_words),
+            np.log1p(n_unique),
+            (n_unique / denom_words).astype(np.float32),
+            n_caps / (n_chars + 1.0),
+            n_punct / (n_chars + 1.0),
+            n_digits / (n_chars + 1.0),
+            np.log1p(elong),
+            np.log1p(leet.astype(np.float32))
+        ]).astype(np.float32)
+        return features
     
     def _extract_sentiment_features(self, texts: pd.Series) -> np.ndarray:
         features = []
@@ -404,40 +405,37 @@ class RobustFeatureEngineer:
         return np.array(features, dtype=np.float32)
     
     def _extract_pos_features(self, texts: pd.Series) -> np.ndarray:
+        if not NLTK_AVAILABLE:
+            missing = [0.0] * len(self.spec.pos_tags) + [1.0]
+            return np.repeat([missing], repeats=len(texts), axis=0).astype(np.float32)
+
         features = []
-        
+
         for text in texts:
             text_hash = hashlib.md5(str(text).encode()).hexdigest()
-            
-            if text_hash not in self.pos_cache:
-                if NLTK_AVAILABLE:
-                    try:
-                        import nltk
-                        # Truncate for speed; configurable via TrainSpec.pos_max_chars
-                        tokens = nltk.word_tokenize(str(text)[:self.spec.pos_max_chars])
-                        pos_tags = nltk.pos_tag(tokens)
-                        
-                        pos_counts = {}
-                        for _, tag in pos_tags:
-                            category = tag[:2]
-                            pos_counts[category] = pos_counts.get(category, 0) + 1
 
-                        total = len(pos_tags) + 1
-                        buckets = [pos_counts.get(tag, 0) / total for tag in self.spec.pos_tags]
-                        feature_vec = buckets + [0.0]
-                    except (LookupError, _nltk_error, OSError, ValueError, TypeError) as e:
-                        logger.exception(
-                            "POS feature extraction failed; using missing-indicator fallback: %s",
-                            e,
-                        )
-                        feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
-                else:
+            if text_hash not in self.pos_cache:
+                try:
+                    import nltk
+                    tokens = nltk.word_tokenize(str(text)[:self.spec.pos_max_chars])
+                    pos_tags = nltk.pos_tag(tokens)
+
+                    pos_counts = {}
+                    for _, tag in pos_tags:
+                        category = tag[:2]
+                        pos_counts[category] = pos_counts.get(category, 0) + 1
+
+                    total = len(pos_tags) + 1
+                    buckets = [pos_counts.get(tag, 0) / total for tag in self.spec.pos_tags]
+                    feature_vec = buckets + [0.0]
+                except (LookupError, OSError, ValueError, TypeError) as e:
+                    logger.exception("POS features failed; falling back with missing-indicator. %s", e)
                     feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
-                
+
                 self.pos_cache[text_hash] = feature_vec
-            
+
             features.append(self.pos_cache[text_hash])
-        
+
         return np.array(features, dtype=np.float32)
 
 class TransformerBackbone:
@@ -719,11 +717,17 @@ class StackingEnsemble:
 
                 model_clone = clone(model)
                 sw = sample_weight[train_idx] if sample_weight is not None else None
-                if ADVANCED_MODELS and name == 'catboost' and issparse(X_train):
-                    X_train = X_train.toarray()
-                    X_val = X_val.toarray()
-                self._fit_with_sw(model_clone, X_train, y[train_idx], sw)
-                pred = model_clone.predict_proba(X_val)[:, 1]
+                if ADVANCED_MODELS and name == 'catboost':
+                    pool_tr = CBPool(
+                        X_train,
+                        label=y[train_idx],
+                        weight=sw if sw is not None else None,
+                    )
+                    model_clone.fit(pool_tr, verbose=False)
+                    pred = model_clone.predict_proba(CBPool(X_val))[:, 1]
+                else:
+                    self._fit_with_sw(model_clone, X_train, y[train_idx], sw)
+                    pred = model_clone.predict_proba(X_val)[:, 1]
 
                 self.oof_predictions[val_idx, model_idx] = pred
 
@@ -739,32 +743,45 @@ class StackingEnsemble:
             X_full = self._assemble_features(X_dict, feat_keys)
 
             sw_full = sample_weight if sample_weight is not None else None
-            if ADVANCED_MODELS and name == 'catboost' and issparse(X_full):
-                X_full = X_full.toarray()
+            if ADVANCED_MODELS and name == 'catboost':
+                pool_full = CBPool(
+                    X_full,
+                    label=y,
+                    weight=sw_full if sw_full is not None else None,
+                )
+                model.fit(pool_full, verbose=False)
+            else:
+                self._fit_with_sw(model, X_full, y, sw_full)
 
-            self._fit_with_sw(model, X_full, y, sw_full)
-            from sklearn.model_selection import StratifiedKFold
-            skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=self.spec.random_state)
+            skf = cv_splitter.main_splitter or StratifiedKFold(
+                n_splits=5, shuffle=True, random_state=self.spec.random_state
+            )
             tr_idx, cal_idx = next(skf.split(X_full, y))
             X_tr, y_tr = X_full[tr_idx], y[tr_idx]
             X_cal, y_cal = X_full[cal_idx], y[cal_idx]
             sw_tr = sw_full[tr_idx] if sw_full is not None else None
             sw_cal = sw_full[cal_idx] if sw_full is not None else None
 
-            if ADVANCED_MODELS and name == 'catboost':
-                if issparse(X_tr):
-                    X_tr = X_tr.toarray()
-                if issparse(X_cal):
-                    X_cal = X_cal.toarray()
-
             model_for_cal = clone(model)
-            self._fit_with_sw(model_for_cal, X_tr, y_tr, sw_tr)
+            if ADVANCED_MODELS and name == 'catboost':
+                model_for_cal.fit(
+                    CBPool(
+                        X_tr,
+                        label=y_tr,
+                        weight=sw_tr if sw_tr is not None else None,
+                    ),
+                    verbose=False,
+                )
+                Xcal_for_fit = CBPool(X_cal)
+            else:
+                self._fit_with_sw(model_for_cal, X_tr, y_tr, sw_tr)
+                Xcal_for_fit = X_cal
             method = cv_splitter.get_calibration_method(len(y))
             self.calibrators[name] = CalibratedClassifierCV(base_estimator=model_for_cal, method=method, cv='prefit')
             if sw_cal is not None:
-                self.calibrators[name].fit(X_cal, y_cal, sample_weight=sw_cal)
+                self.calibrators[name].fit(Xcal_for_fit, y_cal, sample_weight=sw_cal)
             else:
-                self.calibrators[name].fit(X_cal, y_cal)
+                self.calibrators[name].fit(Xcal_for_fit, y_cal)
 
         return self
 
@@ -775,9 +792,10 @@ class StackingEnsemble:
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X = self._assemble_features(X_dict, feat_keys)
 
-            if ADVANCED_MODELS and name == 'catboost' and issparse(X):
-                X = X.toarray()
-            pred = self.calibrators[name].predict_proba(X)[:, 1]
+            if ADVANCED_MODELS and name == 'catboost':
+                pred = self.calibrators[name].predict_proba(CBPool(X))[:, 1]
+            else:
+                pred = self.calibrators[name].predict_proba(X)[:, 1]
             predictions.append(pred)
 
         stacked = np.column_stack(predictions)
@@ -1020,13 +1038,13 @@ class ProductionPipeline:
         
         sorted_idx = np.argsort(difficulties)
         
-        if self.spec.use_transformer and self.transformer:
+        if self.spec.use_transformer and self.transformer and getattr(self.transformer, "mode", "") == "fine_tune":
             for fraction, epochs in self.spec.curriculum_stages:
                 end_idx = int(fraction * len(sorted_idx))
                 stage_idx = sorted_idx[:end_idx]
 
-                logger.info(f"  Stage: {fraction:.0%} of data ({len(stage_idx)} samples)")
-                # TODO: integrate stage-specific fine-tuning once transformer training is enabled
+                logger.info("  Transformer stage: %.0f%% (%d samples, %d epochs)", fraction * 100, len(stage_idx), epochs)
+                self.transformer.spec.transformer_epochs = epochs
     
     def fit(self, train_df: pd.DataFrame, test_df: pd.DataFrame = None):
         logger.info("=" * 60)
@@ -1252,15 +1270,19 @@ class ProductionPipeline:
             
             auc = roc_auc_score(y, oof_ensemble)
             brier = brier_score_loss(y, oof_ensemble)
-            
-            logger.info(f"  Overall: AUC={auc:.4f}, Brier={brier:.4f}")
-            
+
+            logger.info("  Overall: AUC=%.4f, Brier=%.4f", auc, brier)
+
             if groups is not None:
-                for rule in np.unique(groups)[:5]:
+                unique_rules = np.unique(groups)
+                max_rules = self.spec.error_rules_max
+                if isinstance(max_rules, int) and max_rules > 0:
+                    unique_rules = unique_rules[:max_rules]
+                for rule in unique_rules:
                     mask = groups == rule
                     if mask.sum() > 10:
                         rule_auc = roc_auc_score(y[mask], oof_ensemble[mask])
-                        logger.info(f"  Rule '{rule}': AUC={rule_auc:.4f}")
+                        logger.info("  Rule '%s': AUC=%.4f", rule, rule_auc)
     
     def _save_model_bundle(self):
         model_dir = Path(self.spec.model_path)
@@ -1295,8 +1317,16 @@ class ProductionPipeline:
                 logger.warning(f"Failed to save transformer: {exc}")
         logger.warning("SECURITY: joblib uses pickle. Only load bundle.joblib from trusted sources.")
 
+def setup_logging(level=logging.INFO):
+    """Configure logging once at runtime."""
+
+    if not logger.handlers:
+        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
 def main():
-    # set seeds at runtime (avoids side effects on import)
+    # configure logging and set seeds at runtime (avoids import-time side effects)
+    setup_logging()
     set_all_seeds(42)
     spec = TrainSpec()
 
