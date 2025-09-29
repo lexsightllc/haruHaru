@@ -19,10 +19,11 @@ from urllib.error import URLError, HTTPError  # for precise NLTK download errors
 import numpy as np
 import pandas as pd
 from scipy.sparse import hstack, csr_matrix, vstack, issparse
+from scipy.sparse import vstack as sp_vstack
 from scipy.stats import entropy
 import unicodedata
 
-from sklearn.model_selection import StratifiedKFold, GroupKFold
+from sklearn.model_selection import StratifiedKFold, GroupKFold, train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD, NMF
@@ -61,49 +62,51 @@ except ImportError:
     SENTIMENT_AVAILABLE = False
 
 
-def _ensure_nltk_resources(nltk_data_env: Optional[str] = None) -> bool:
+nltk = None
+NLTK_AVAILABLE = False
+
+
+def _ensure_nltk_resources(nltk_module, nltk_data_env: Optional[str] = None) -> bool:
     """
     Ensure tokenizer & POS tagger exist. Uses NLTK_DATA env var if provided.
     Avoids modifying nltk.data.path globally.
     """
 
+    if nltk_module is None:
+        return False
+
     try:
         if nltk_data_env:
             os.environ.setdefault("NLTK_DATA", nltk_data_env)
 
-        import nltk  # lazy import
-
         def _tagger_exists() -> bool:
             try:
-                nltk.data.find('taggers/averaged_perceptron_tagger_eng/')
+                nltk_module.data.find('taggers/averaged_perceptron_tagger_eng/')
                 return True
             except LookupError:
                 try:
-                    nltk.data.find('taggers/averaged_perceptron_tagger/')
+                    nltk_module.data.find('taggers/averaged_perceptron_tagger/')
                     return True
                 except LookupError:
                     return False
 
         try:
-            nltk.data.find('tokenizers/punkt')
+            nltk_module.data.find('tokenizers/punkt')
             if not _tagger_exists():
                 raise LookupError("POS tagger not found")
         except LookupError:
             if not os.path.exists('/kaggle'):
-                nltk.download('punkt', quiet=True)
+                nltk_module.download('punkt', quiet=True)
                 try:
-                    nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+                    nltk_module.download('averaged_perceptron_tagger_eng', quiet=True)
                 except (URLError, HTTPError, OSError):
-                    nltk.download('averaged_perceptron_tagger', quiet=True)
+                    nltk_module.download('averaged_perceptron_tagger', quiet=True)
             else:
                 return False
         return True
     except (LookupError, OSError) as exc:
         warnings.warn(f"NLTK resources unavailable: {exc}")
         return False
-
-
-NLTK_AVAILABLE = _ensure_nltk_resources(os.environ.get("NLTK_DATA"))
 
 try:
     import optuna
@@ -114,6 +117,7 @@ except ImportError:
 
 try:
     import torch
+    from torch.utils.data import DataLoader, TensorDataset
     from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
     from transformers import get_linear_schedule_with_warmup
     from torch.optim import AdamW
@@ -138,9 +142,7 @@ class TrainSpec:
     model_path: str = "/kaggle/working/models"
 
     random_state: int = 42
-    # Use n_splits_cv for scikit-learn consistency; cv_folds kept for backward-compat.
     n_splits_cv: int = 5
-    cv_folds: int = 5
     early_stopping_rounds: int = 50
 
     max_tfidf_features: int = 30000
@@ -216,7 +218,7 @@ class CrossValidator:
         self.group_splitter = None
 
     def setup(self, y: np.ndarray, groups: Optional[np.ndarray] = None):
-        n_splits = getattr(self.spec, "n_splits_cv", self.spec.cv_folds)
+        n_splits = getattr(self.spec, "n_splits_cv", 5)
         self.main_splitter = StratifiedKFold(
             n_splits=n_splits,
             shuffle=True,
@@ -299,13 +301,24 @@ class RobustFeatureEngineer:
         word_features = self.word_vectorizer.transform(texts_clean)
         char_features = self.char_vectorizer.transform(texts_clean)
         tfidf_combined = hstack([word_features, char_features], format='csr')
-        self.svd = TruncatedSVD(
-            n_components=min(self.spec.svd_dim, tfidf_combined.shape[1] - 1),
-            random_state=self.spec.random_state
-        )
-        tfidf_reduced = self.svd.fit_transform(tfidf_combined)
-        self.scaler = StandardScaler(with_mean=True)
-        self.scaler.fit(tfidf_reduced)
+        n_tfidf_features = tfidf_combined.shape[1]
+        if n_tfidf_features <= 1 or self.spec.svd_dim <= 0:
+            logger.warning(
+                "Skipping SVD: insufficient TF-IDF features (n_features=%d).",
+                n_tfidf_features,
+            )
+            self.svd = None
+            self.scaler = None
+        else:
+            n_components = min(self.spec.svd_dim, n_tfidf_features - 1)
+            n_components = max(1, n_components)
+            self.svd = TruncatedSVD(
+                n_components=n_components,
+                random_state=self.spec.random_state
+            )
+            tfidf_reduced = self.svd.fit_transform(tfidf_combined)
+            self.scaler = StandardScaler(with_mean=True)
+            self.scaler.fit(tfidf_reduced)
 
         if self.spec.use_sentiment and SENTIMENT_AVAILABLE:
             self.sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -324,11 +337,13 @@ class RobustFeatureEngineer:
         char_features = self.char_vectorizer.transform(texts_clean)
         
         tfidf_combined = hstack([word_features, char_features], format='csr')
-        # Transform only (fit happened in fit())
-        tfidf_reduced = self.svd.transform(tfidf_combined)
-        tfidf_reduced = self.scaler.transform(tfidf_reduced)
-
-        features['sparse_reduced'] = csr_matrix(tfidf_reduced)
+        if self.svd is not None:
+            tfidf_reduced = self.svd.transform(tfidf_combined)
+            if self.scaler is not None:
+                tfidf_reduced = self.scaler.transform(tfidf_reduced)
+            features['svd_features'] = csr_matrix(tfidf_reduced)
+        else:
+            features['svd_features'] = tfidf_combined.astype(np.float32)
         
         topic_matrix = self.topic_vectorizer.transform(texts_clean)
         topic_features = self.topic_model.transform(topic_matrix)
@@ -367,13 +382,19 @@ class RobustFeatureEngineer:
         s = texts.astype(str)
         n_chars = s.str.len().astype(np.float32)
         n_words = s.str.count(r"\S+").astype(np.float32)
-        n_unique = s.str.lower().str.split().map(lambda xs: len(set(xs))).astype(np.float32)
+        tokens = s.str.lower().str.findall(r"\b\w+\b")
+        n_unique = (
+            tokens.explode()
+            .groupby(level=0)
+            .nunique()
+            .reindex(s.index, fill_value=0)
+            .astype(np.float32)
+        )
         n_caps = s.str.count(r"[A-Z]").astype(np.float32)
         n_punct = s.str.count(r"[!\?\.,:;]").astype(np.float32)
         n_digits = s.str.count(r"\d").astype(np.float32)
         elong = s.str.count(r"(.)\1{2,}").astype(np.float32)
-        leet_pairs = ["@", "3", "!", "1", r"\$"]
-        leet = sum(s.str.contains(p, regex=True).astype(np.float32) for p in leet_pairs)
+        leet = s.str.count(r"[@3!1$]").astype(np.float32)
         denom_words = n_words + 1.0
         features = np.column_stack([
             np.log1p(n_chars),
@@ -416,13 +437,11 @@ class RobustFeatureEngineer:
         return np.array(features, dtype=np.float32)
     
     def _extract_pos_features(self, texts: pd.Series) -> np.ndarray:
-        if not NLTK_AVAILABLE:
+        if not NLTK_AVAILABLE or nltk is None:
             missing = [0.0] * len(self.spec.pos_tags) + [1.0]
             return np.repeat([missing], repeats=len(texts), axis=0).astype(np.float32)
 
         features = []
-
-        import nltk  # local import, outside the inner loop
 
         for text in texts:
             text_hash = hashlib.md5(str(text).encode()).hexdigest()
@@ -497,9 +516,6 @@ class TransformerBackbone:
     def fine_tune(self, texts, labels, val_texts=None, val_labels=None):
         if self.mode != 'fine_tune' or not TRANSFORMERS_AVAILABLE:
             return
-
-        from torch.utils.data import DataLoader, TensorDataset
-        from sklearn.model_selection import train_test_split
 
         labels_array = np.array(labels)
         texts_array = texts.to_numpy() if hasattr(texts, "to_numpy") else np.array(list(texts))
@@ -683,13 +699,13 @@ class StackingEnsemble:
                 verbose=False
             )
         self.model_features = {
-            'logreg': ['sparse_reduced'],
-            'sgd': ['sparse_reduced'],
-            'lgbm_sparse': ['sparse_reduced'],
+            'logreg': ['svd_features'],
+            'sgd': ['svd_features'],
+            'lgbm_sparse': ['svd_features'],
         }
         if ADVANCED_MODELS:
             self.model_features['catboost'] = (
-                ['sparse_reduced', 'meta', 'topic'] if self.spec.catboost_use_svd else ['meta', 'topic']
+                ['svd_features', 'meta', 'topic'] if self.spec.catboost_use_svd else ['meta', 'topic']
             )
 
     def _assemble_features(self, X_dict, feat_keys):
@@ -718,11 +734,11 @@ class StackingEnsemble:
 
         self.oof_predictions = np.zeros((n_samples, n_models))
 
-        for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_dict['sparse_reduced'], y, groups)):
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_dict['svd_features'], y, groups)):
             logger.info(f"Generating OOF for fold {fold_idx + 1}")
 
             for model_idx, (name, model) in enumerate(self.base_models.items()):
-                feat_keys = self.model_features.get(name, ['sparse_reduced'])
+                feat_keys = self.model_features.get(name, ['svd_features'])
                 X_full = self._assemble_features(X_dict, feat_keys)
                 X_train = X_full[train_idx]
                 X_val = X_full[val_idx]
@@ -751,7 +767,7 @@ class StackingEnsemble:
 
         logger.info("Refitting base models and calibrating...")
         for name, model in self.base_models.items():
-            feat_keys = self.model_features.get(name, ['sparse_reduced'])
+            feat_keys = self.model_features.get(name, ['svd_features'])
             X_full = self._assemble_features(X_dict, feat_keys)
 
             sw_full = sample_weight if sample_weight is not None else None
@@ -806,7 +822,7 @@ class StackingEnsemble:
         predictions = []
 
         for name, model in self.base_models.items():
-            feat_keys = self.model_features.get(name, ['sparse_reduced'])
+            feat_keys = self.model_features.get(name, ['svd_features'])
             X = self._assemble_features(X_dict, feat_keys)
 
             pred = self.calibrators[name].predict_proba(X)[:, 1]
@@ -832,7 +848,7 @@ class HierarchicalRouter:
         )
         
         X_combined = hstack([
-            X_dict['sparse_reduced'],
+            X_dict['svd_features'],
             csr_matrix(X_dict['meta'])
         ], format='csr')
         
@@ -862,7 +878,7 @@ class HierarchicalRouter:
     
     def predict(self, X_dict, known_rules=None):
         X_combined = hstack([
-            X_dict['sparse_reduced'],
+            X_dict['svd_features'],
             csr_matrix(X_dict['meta'])
         ], format='csr')
         
@@ -923,13 +939,13 @@ class BorderlineGate:
         )
 
         if sample_weight is not None:
-            self.fast_model.fit(X_dict['sparse_reduced'], y, sample_weight=sample_weight)
+            self.fast_model.fit(X_dict['svd_features'], y, sample_weight=sample_weight)
         else:
-            self.fast_model.fit(X_dict['sparse_reduced'], y)
+            self.fast_model.fit(X_dict['svd_features'], y)
         return self
     
     def should_route_to_expensive(self, X_dict, base_predictions):
-        fast_prob = self.fast_model.predict_proba(X_dict['sparse_reduced'])[:, 1]
+        fast_prob = self.fast_model.predict_proba(X_dict['svd_features'])[:, 1]
         
         pred_entropy = entropy(np.column_stack([
             base_predictions,
@@ -962,7 +978,7 @@ class ProductionPipeline:
 
         adv_scores = {}
 
-        for feat_name in ['sparse_reduced', 'meta', 'topic']:
+        for feat_name in ['svd_features', 'meta', 'topic']:
             if feat_name not in X_train_dict:
                 continue
 
@@ -982,8 +998,10 @@ class ProductionPipeline:
                 X_train_sample = X_train_sample.toarray()
                 X_test_sample = X_test_sample.toarray()
 
-            from scipy.sparse import vstack as sp_vstack
-            X_combined = sp_vstack([X_train_sample, X_test_sample]) if issparse(X_train_sample) else np.vstack([X_train_sample, X_test_sample])
+            if issparse(X_train_sample):
+                X_combined = sp_vstack([X_train_sample, X_test_sample])
+            else:
+                X_combined = np.vstack([X_train_sample, X_test_sample])
             y_combined = np.concatenate([
                 np.zeros(n_train),
                 np.ones(n_test)
@@ -1035,8 +1053,8 @@ class ProductionPipeline:
     def _combine_features(self, X_dict):
         features = []
 
-        if 'sparse_reduced' in X_dict:
-            features.append(X_dict['sparse_reduced'])
+        if 'svd_features' in X_dict:
+            features.append(X_dict['svd_features'])
 
         for key in ['meta', 'topic', 'sentiment', 'pos']:
             if key in X_dict:
@@ -1056,9 +1074,9 @@ class ProductionPipeline:
             solver='liblinear',
             random_state=self.spec.random_state
         )
-        simple_model.fit(X_dict['sparse_reduced'], y)
+        simple_model.fit(X_dict['svd_features'], y)
         
-        probas = simple_model.predict_proba(X_dict['sparse_reduced'])[:, 1]
+        probas = simple_model.predict_proba(X_dict['svd_features'])[:, 1]
         difficulties = np.abs(probas - 0.5)
         
         sorted_idx = np.argsort(difficulties)
@@ -1189,10 +1207,8 @@ class ProductionPipeline:
         if self.gate and self.stacker:
             base_preds_list = []
             for name, _ in self.stacker.base_models.items():
-                feat_keys = self.stacker.model_features.get(name, ['sparse_reduced'])
+                feat_keys = self.stacker.model_features.get(name, ['svd_features'])
                 X = self.stacker._assemble_features(X_test_dict, feat_keys)
-                if ADVANCED_MODELS and name == 'catboost' and issparse(X):
-                    X = X.toarray()
                 pred = self.stacker.calibrators[name].predict_proba(X)[:, 1]
                 base_preds_list.append(pred)
 
@@ -1384,8 +1400,18 @@ def setup_environment(spec: TrainSpec):
     os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
     if spec.nltk_data_dir:
         os.environ.setdefault('NLTK_DATA', spec.nltk_data_dir)
-    global NLTK_AVAILABLE
-    NLTK_AVAILABLE = _ensure_nltk_resources(os.environ.get("NLTK_DATA"))
+    global nltk, NLTK_AVAILABLE
+    if nltk is None:
+        try:
+            import nltk as nltk_module
+        except ImportError:
+            nltk = None
+            NLTK_AVAILABLE = False
+            return
+        else:
+            nltk = nltk_module
+
+    NLTK_AVAILABLE = _ensure_nltk_resources(nltk, os.environ.get("NLTK_DATA"))
 
 
 def main():
