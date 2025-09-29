@@ -9,7 +9,9 @@ os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 
 # Suppress warnings early
 import warnings
-warnings.filterwarnings("ignore")
+# Prefer targeted filtering instead of blanket suppression. Configure
+# filter rules near noisy call sites if needed, e.g.:
+# warnings.filterwarnings("ignore", category=DeprecationWarning, module="module.name")
 
 import gc
 import json
@@ -31,7 +33,7 @@ from sklearn.model_selection import StratifiedKFold, GroupKFold
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD, NMF
-from sklearn.linear_model import LogisticRegression, SGDClassifier, Ridge
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
@@ -45,7 +47,18 @@ try:
     ADVANCED_MODELS = True
 except ImportError:
     ADVANCED_MODELS = False
-    print("XGBoost/CatBoost not available")
+    missing = []
+    try:
+        import xgboost  # noqa: F401
+    except Exception:
+        missing.append("XGBoost")
+    try:
+        from catboost import CatBoostClassifier  # noqa: F401
+    except Exception:
+        missing.append("CatBoost")
+    if not missing:
+        missing.append("XGBoost/CatBoost")
+    print(f"Advanced models not available: {', '.join(missing)}")
 
 try:
     from textblob import TextBlob
@@ -70,8 +83,9 @@ try:
             nltk.download('averaged_perceptron_tagger', quiet=True)
         else:
             NLTK_AVAILABLE = False
-except:
+except (LookupError, nltk.NLTKError, OSError) as exc:
     NLTK_AVAILABLE = False
+    warnings.warn(f"NLTK resources unavailable: {exc}")
 
 try:
     import optuna
@@ -83,11 +97,15 @@ except ImportError:
 try:
     import torch
     from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
-    from transformers import AdamW, get_linear_schedule_with_warmup
+    from transformers import get_linear_schedule_with_warmup
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
     print("Transformers not available")
+try:
+    from torch.optim import AdamW
+except ImportError:
+    AdamW = None
 
 def set_all_seeds(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -96,7 +114,6 @@ def set_all_seeds(seed=42):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-warnings.filterwarnings("ignore")
 set_all_seeds(42)
 
 @dataclass
@@ -121,6 +138,7 @@ class TrainSpec:
     use_stacking: bool = True
     use_hierarchical: bool = True
     use_borderline_gate: bool = True
+    hierarchical_top_k: int = 3
     
     use_curriculum: bool = True
     use_pseudo_labeling: bool = False
@@ -330,7 +348,7 @@ class RobustFeatureEngineer:
                 blob = TextBlob(text_str)
                 polarity = blob.sentiment.polarity
                 subjectivity = blob.sentiment.subjectivity
-            except:
+            except Exception:
                 polarity, subjectivity = 0, 0
             
             if self.sentiment_analyzer:
@@ -371,7 +389,7 @@ class RobustFeatureEngineer:
                             pos_counts.get('JJ', 0) / total,
                             pos_counts.get('RB', 0) / total,
                         ]
-                    except:
+                    except (LookupError, nltk.NLTKError):
                         feature_vec = [0.25, 0.25, 0.25, 0.25]
                 else:
                     feature_vec = [0.25, 0.25, 0.25, 0.25]
@@ -388,7 +406,10 @@ class TransformerBackbone:
         self.mode = mode
         self.model = None
         self.tokenizer = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if TRANSFORMERS_AVAILABLE:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = None
         
     def setup(self, n_labels=2, multi_task=False):
         if not TRANSFORMERS_AVAILABLE:
@@ -433,7 +454,10 @@ class TransformerBackbone:
             shuffle=True
         )
         
-        optimizer = AdamW(self.model.parameters(), lr=2e-5)
+        if AdamW is not None:
+            optimizer = AdamW(self.model.parameters(), lr=2e-5)
+        else:
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-5)
         total_steps = len(train_loader) * 3
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
@@ -507,7 +531,7 @@ class StackingEnsemble:
         )
         
         self.base_models['sgd'] = SGDClassifier(
-            loss='log',
+            loss='log_loss',
             penalty='elasticnet',
             l1_ratio=0.15,
             class_weight='balanced',
@@ -533,85 +557,99 @@ class StackingEnsemble:
                 random_seed=self.spec.random_state,
                 verbose=False
             )
-    
-    def fit(self, X_dict, y, cv_splitter, groups=None):
+        self.model_features = {
+            'logreg': ['sparse_reduced'],
+            'sgd': ['sparse_reduced'],
+            'lgbm_sparse': ['sparse_reduced'],
+        }
+        if ADVANCED_MODELS:
+            self.model_features['catboost'] = ['meta', 'topic']
+
+    def fit(self, X_dict, y, cv_splitter, groups=None, sample_weight=None):
         n_samples = len(y)
         n_models = len(self.base_models)
-        
+
         self.oof_predictions = np.zeros((n_samples, n_models))
-        
+
         for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_dict['sparse_reduced'], y, groups)):
             print(f"Generating OOF for fold {fold_idx + 1}")
-            
+
             for model_idx, (name, model) in enumerate(self.base_models.items()):
-                if 'sparse' in name or 'logreg' in name or 'sgd' in name:
-                    X_train = X_dict['sparse_reduced'][train_idx]
-                    X_val = X_dict['sparse_reduced'][val_idx]
+                feat_keys = self.model_features.get(name, ['sparse_reduced'])
+                if len(feat_keys) == 1 and hasattr(X_dict[feat_keys[0]], 'tocsr'):
+                    X_train = X_dict[feat_keys[0]][train_idx]
+                    X_val = X_dict[feat_keys[0]][val_idx]
                 else:
-                    dense_features = np.hstack([
-                        X_dict['meta'][train_idx],
-                        X_dict['topic'][train_idx]
-                    ])
-                    X_train = dense_features
-                    
-                    dense_features_val = np.hstack([
-                        X_dict['meta'][val_idx],
-                        X_dict['topic'][val_idx]
-                    ])
-                    X_val = dense_features_val
-                
+                    X_train = np.hstack([X_dict[key][train_idx] for key in feat_keys])
+                    X_val = np.hstack([X_dict[key][val_idx] for key in feat_keys])
+
                 model_clone = clone(model)
-                model_clone.fit(X_train, y[train_idx])
+                sw = sample_weight[train_idx] if sample_weight is not None else None
+                try:
+                    model_clone.fit(X_train, y[train_idx], sample_weight=sw)
+                except TypeError:
+                    model_clone.fit(X_train, y[train_idx])
                 pred = model_clone.predict_proba(X_val)[:, 1]
-                
+
                 self.oof_predictions[val_idx, model_idx] = pred
-        
-        self.meta_model = Ridge(alpha=1.0, random_state=self.spec.random_state)
-        self.meta_model.fit(self.oof_predictions, y)
-        
+
+        self.meta_model = LogisticRegression(max_iter=1000, solver='lbfgs')
+        meta_fit_kwargs = {}
+        if sample_weight is not None:
+            meta_fit_kwargs['sample_weight'] = sample_weight
+        self.meta_model.fit(self.oof_predictions, y, **meta_fit_kwargs)
+
         print("Refitting base models on full data...")
         for name, model in self.base_models.items():
-            if 'sparse' in name or 'logreg' in name or 'sgd' in name:
-                X_full = X_dict['sparse_reduced']
+            feat_keys = self.model_features.get(name, ['sparse_reduced'])
+            if len(feat_keys) == 1 and hasattr(X_dict[feat_keys[0]], 'tocsr'):
+                X_full = X_dict[feat_keys[0]]
             else:
-                X_full = np.hstack([X_dict['meta'], X_dict['topic']])
-            
-            model.fit(X_full, y)
-            
+                X_full = np.hstack([X_dict[key] for key in feat_keys])
+
+            sw_full = sample_weight if sample_weight is not None else None
+            try:
+                model.fit(X_full, y, sample_weight=sw_full)
+            except TypeError:
+                model.fit(X_full, y)
+
             calibration_method = cv_splitter.get_calibration_method(len(y))
             self.calibrators[name] = CalibratedClassifierCV(
-                model,
+                base_estimator=model,
                 method=calibration_method,
-                cv='prefit'
+                cv=5
             )
-            
-            train_pred = model.predict_proba(X_full)[:, 1]
-            self.calibrators[name].fit(X_full, y)
-        
+            calibrator_fit_kwargs = {}
+            if sw_full is not None:
+                calibrator_fit_kwargs['sample_weight'] = sw_full
+            self.calibrators[name].fit(X_full, y, **calibrator_fit_kwargs)
+
         return self
-    
+
     def predict(self, X_dict):
         predictions = []
-        
+
         for name, model in self.base_models.items():
-            if 'sparse' in name or 'logreg' in name or 'sgd' in name:
-                X = X_dict['sparse_reduced']
+            feat_keys = self.model_features.get(name, ['sparse_reduced'])
+            if len(feat_keys) == 1 and hasattr(X_dict[feat_keys[0]], 'tocsr'):
+                X = X_dict[feat_keys[0]]
             else:
-                X = np.hstack([X_dict['meta'], X_dict['topic']])
-            
+                X = np.hstack([X_dict[key] for key in feat_keys])
+
             pred = self.calibrators[name].predict_proba(X)[:, 1]
             predictions.append(pred)
-        
+
         stacked = np.column_stack(predictions)
-        final_pred = self.meta_model.predict(stacked)
-        
-        return np.clip(final_pred, 0, 1)
+        final_pred = self.meta_model.predict_proba(stacked)[:, 1]
+
+        return np.clip(final_pred, 0.0, 1.0)
 
 class HierarchicalRouter:
     def __init__(self, spec: TrainSpec):
         self.spec = spec
         self.rule_classifier = None
         self.violation_experts = {}
+        self.rule_classes_ = None
         
     def fit(self, X_dict, y, rules):
         self.rule_classifier = lgb.LGBMClassifier(
@@ -626,6 +664,7 @@ class HierarchicalRouter:
         ], format='csr')
         
         self.rule_classifier.fit(X_combined, rules)
+        self.rule_classes_ = self.rule_classifier.classes_
         
         unique_rules = np.unique(rules)
         for rule in unique_rules:
@@ -668,16 +707,18 @@ class HierarchicalRouter:
                     routed_scores[i] = 0.5
         
         rule_probs = self.rule_classifier.predict_proba(X_combined)
-        
+
+        classes = self.rule_classes_ if self.rule_classes_ is not None else self.rule_classifier.classes_
+        top_k = getattr(self.spec, "hierarchical_top_k", 3)
+
         for i in range(n_samples):
-            top_k = 3
             top_rules = np.argsort(rule_probs[i])[-top_k:]
             
             weighted_score = 0
             weight_sum = 0
             
             for rule_idx in top_rules:
-                rule = self.rule_classifier.classes_[rule_idx]
+                rule = classes[rule_idx]
                 if rule in self.violation_experts:
                     prob = rule_probs[i, rule_idx]
                     violation_prob = self.violation_experts[rule].predict_proba(
@@ -696,15 +737,18 @@ class BorderlineGate:
         self.entropy_threshold = entropy_threshold
         self.fast_model = None
         
-    def fit(self, X_dict, y):
+    def fit(self, X_dict, y, sample_weight=None):
         self.fast_model = LogisticRegression(
             max_iter=1000,
             solver='liblinear',
             class_weight='balanced',
             random_state=self.spec.random_state
         )
-        
-        self.fast_model.fit(X_dict['sparse_reduced'], y)
+
+        if sample_weight is not None:
+            self.fast_model.fit(X_dict['sparse_reduced'], y, sample_weight=sample_weight)
+        else:
+            self.fast_model.fit(X_dict['sparse_reduced'], y)
         return self
     
     def should_route_to_expensive(self, X_dict, base_predictions):
@@ -869,7 +913,7 @@ class ProductionPipeline:
         
         if self.spec.use_augmentation:
             X_train_dict, y_train, groups, rules = self._augment_data(X_train_dict, y_train, train_df, groups, rules)
-        
+
         if self.spec.use_transformer:
             print("\nSetting up Transformer:")
             self.transformer = TransformerBackbone(self.spec, mode='embed_only')
@@ -886,7 +930,13 @@ class ProductionPipeline:
             print("\nTraining Stacking Ensemble:")
             self.stacker = StackingEnsemble(self.spec)
             self.stacker.setup_models(X_train_dict['sparse_reduced'].shape)
-            self.stacker.fit(X_train_dict, y_train, self.cv, groups)
+            self.stacker.fit(
+                X_train_dict,
+                y_train,
+                self.cv,
+                groups,
+                sample_weight=self.adversarial_weights
+            )
             
             self.model_bundle['oof_predictions'] = self.stacker.oof_predictions
         
@@ -898,7 +948,7 @@ class ProductionPipeline:
         if self.spec.use_borderline_gate:
             print("\nTraining Borderline Gate:")
             self.gate = BorderlineGate(self.spec)
-            self.gate.fit(X_train_dict, y_train)
+            self.gate.fit(X_train_dict, y_train, sample_weight=self.adversarial_weights)
         
         self._setup_drift_monitor(X_train_dict, y_train)
         
@@ -936,11 +986,12 @@ class ProductionPipeline:
         if self.gate and self.stacker:
             base_preds = []
             for name, model in self.stacker.base_models.items():
-                if 'sparse' in name or 'logreg' in name or 'sgd' in name:
-                    X = X_test_dict['sparse_reduced']
+                feat_keys = self.stacker.model_features.get(name, ['sparse_reduced'])
+                if len(feat_keys) == 1 and hasattr(X_test_dict[feat_keys[0]], 'tocsr'):
+                    X = X_test_dict[feat_keys[0]]
                 else:
-                    X = np.hstack([X_test_dict['meta'], X_test_dict['topic']])
-                
+                    X = np.hstack([X_test_dict[key] for key in feat_keys])
+
                 pred = model.predict_proba(X)[:, 1]
                 base_preds.append(pred)
             
@@ -1015,7 +1066,11 @@ class ProductionPipeline:
         
         y_aug = y[aug_idx]
         y_combined = np.concatenate([y, y_aug])
-        
+
+        if self.adversarial_weights is not None:
+            weights_aug = self.adversarial_weights[aug_idx]
+            self.adversarial_weights = np.concatenate([self.adversarial_weights, weights_aug])
+
         groups_aug = groups[aug_idx] if groups is not None else None
         groups_combined = np.concatenate([groups, groups_aug]) if groups is not None else None
         
@@ -1059,8 +1114,22 @@ class ProductionPipeline:
         
         with open(model_dir / "config.json", "w") as f:
             json.dump(asdict(self.spec), f, indent=2)
-        
-        print(f"\nModels saved to {model_dir}")
+        try:
+            import joblib
+        except ImportError as exc:
+            warnings.warn(f"Joblib not available, skipping bundle persistence: {exc}")
+            return
+
+        joblib.dump({
+            "feature_engineer": self.feature_engineer,
+            "stacker": self.stacker,
+            "hierarchical": self.hierarchical,
+            "borderline_gate": self.gate,
+            "transformer_model": self.spec.transformer_model if self.transformer else None,
+            "drift_monitor": self.drift_monitor,
+        }, model_dir / "bundle.joblib")
+
+        print(f"\nModels saved to {model_dir} (config.json, bundle.joblib)")
 
 def main():
     spec = TrainSpec()
