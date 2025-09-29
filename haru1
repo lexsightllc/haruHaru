@@ -36,6 +36,7 @@ from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.metrics import roc_auc_score, brier_score_loss
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.base import clone
+from sklearn.exceptions import NotFittedError
 
 import lightgbm as lgb
 try:
@@ -284,7 +285,7 @@ class RobustFeatureEngineer:
         )
         tfidf_reduced = self.svd.fit_transform(tfidf_combined)
         self.scaler = StandardScaler(with_mean=True)
-        _ = self.scaler.fit_transform(tfidf_reduced)
+        self.scaler.fit(tfidf_reduced)
 
         if self.spec.use_sentiment and SENTIMENT_AVAILABLE:
             self.sentiment_analyzer = SentimentIntensityAnalyzer()
@@ -424,7 +425,11 @@ class RobustFeatureEngineer:
                         total = len(pos_tags) + 1
                         buckets = [pos_counts.get(tag, 0) / total for tag in self.spec.pos_tags]
                         feature_vec = buckets + [0.0]
-                    except (LookupError, _nltk_error):
+                    except (LookupError, _nltk_error, OSError, ValueError, TypeError) as e:
+                        logger.exception(
+                            "POS feature extraction failed; using missing-indicator fallback: %s",
+                            e,
+                        )
                         feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
                 else:
                     feature_vec = [0.0] * len(self.spec.pos_tags) + [1.0]
@@ -844,6 +849,10 @@ class HierarchicalRouter:
         
         rule_probs = self.rule_classifier.predict_proba(X_combined)
 
+        if self.rule_classes_ is None:
+            raise NotFittedError(
+                "HierarchicalRouter is not fitted yet. Call fit() before predict()."
+            )
         classes = self.rule_classes_
         top_k = getattr(self.spec, "hierarchical_top_k", 3)
 
