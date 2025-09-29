@@ -1278,10 +1278,26 @@ def main():
     logger.info("Making predictions…")
     predictions = pipeline.predict(test_df)
 
-    submission = pd.DataFrame({
-        'row_id': range(len(predictions)),
-        'rule_violation': predictions
-    })
+    logger.info("Building submission…")
+
+    pred = np.asarray(predictions, dtype=float)
+    pred = np.clip(pred, 0.0, 1.0)
+
+    sample_path = Path(spec.test_path).with_name("sample_submission.csv")
+    sample = pd.read_csv(sample_path)
+
+    if 'row_id' not in test_df.columns:
+        raise ValueError("Expected 'row_id' in test.csv; cannot build a valid submission.")
+
+    by_row = pd.Series(pred, index=test_df['row_id']).rename('rule_violation')
+
+    submission = sample[['row_id']].merge(by_row.reset_index(), on='row_id', how='left')
+    submission['rule_violation'] = (
+        submission['rule_violation'].astype(float).clip(0, 1).fillna(0.5)
+    )
+
+    assert submission.shape == sample.shape, "Submission shape must match sample_submission.csv"
+    assert submission['rule_violation'].notna().all(), "No NaNs allowed in rule_violation"
 
     submission.to_csv("/kaggle/working/submission.csv", index=False)
     logger.info("Pipeline complete!")
