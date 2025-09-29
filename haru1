@@ -1,0 +1,1090 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+
+# Disable debugger warnings
+os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+
+# Suppress warnings early
+import warnings
+warnings.filterwarnings("ignore")
+
+import gc
+import json
+import hashlib
+import pickle
+import re
+from pathlib import Path
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional, Union, Any
+import tracemalloc
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import hstack, csr_matrix, vstack
+from scipy.stats import entropy
+import unicodedata
+
+from sklearn.model_selection import StratifiedKFold, GroupKFold
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import TruncatedSVD, NMF
+from sklearn.linear_model import LogisticRegression, SGDClassifier, Ridge
+from sklearn.metrics import roc_auc_score, brier_score_loss, log_loss
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.isotonic import IsotonicRegression
+from sklearn.base import clone, BaseEstimator, TransformerMixin
+from sklearn.utils.class_weight import compute_class_weight
+
+import lightgbm as lgb
+try:
+    import xgboost as xgb
+    from catboost import CatBoostClassifier
+    ADVANCED_MODELS = True
+except ImportError:
+    ADVANCED_MODELS = False
+    print("XGBoost/CatBoost not available")
+
+try:
+    from textblob import TextBlob
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    SENTIMENT_AVAILABLE = True
+except ImportError:
+    SENTIMENT_AVAILABLE = False
+
+import nltk
+NLTK_AVAILABLE = True
+try:
+    # Try Kaggle's pre-downloaded path
+    nltk.data.path.append('/kaggle/input/nltk-data/')
+    # Try to use existing data without downloading
+    try:
+        nltk.data.find('tokenizers/punkt')
+        nltk.data.find('taggers/averaged_perceptron_tagger')
+    except LookupError:
+        # Only try download if not in Kaggle
+        if not os.path.exists('/kaggle'):
+            nltk.download('punkt', quiet=True)
+            nltk.download('averaged_perceptron_tagger', quiet=True)
+        else:
+            NLTK_AVAILABLE = False
+except:
+    NLTK_AVAILABLE = False
+
+try:
+    import optuna
+    from optuna.pruners import MedianPruner
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModel, AutoModelForSequenceClassification
+    from transformers import AdamW, get_linear_schedule_with_warmup
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("Transformers not available")
+
+def set_all_seeds(seed=42):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    if TRANSFORMERS_AVAILABLE:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+warnings.filterwarnings("ignore")
+set_all_seeds(42)
+
+@dataclass
+class TrainSpec:
+    train_path: str = "/kaggle/input/jigsaw-agile-community-rules/train.csv"
+    test_path: str = "/kaggle/input/jigsaw-agile-community-rules/test.csv"
+    model_path: str = "/kaggle/working/models"
+    
+    random_state: int = 42
+    cv_folds: int = 5
+    early_stopping_rounds: int = 50
+    
+    max_tfidf_features: int = 30000
+    max_char_features: int = 20000
+    svd_dim: int = 1024
+    use_sentiment: bool = SENTIMENT_AVAILABLE
+    use_pos_features: bool = True
+    topic_components: int = 20
+    
+    use_transformer: bool = TRANSFORMERS_AVAILABLE
+    transformer_model: str = "distilbert-base-uncased"
+    use_stacking: bool = True
+    use_hierarchical: bool = True
+    use_borderline_gate: bool = True
+    
+    use_curriculum: bool = True
+    use_pseudo_labeling: bool = False
+    use_adversarial_validation: bool = True
+    use_augmentation: bool = True
+    augmentation_ratio: float = 0.2
+    
+    calibration_mode: str = "sigmoid"
+    min_samples_isotonic: int = 300
+    
+    use_onnx: bool = False
+    use_conformal: bool = True
+    track_drift: bool = True
+    
+    optimize_hyperparams: bool = OPTUNA_AVAILABLE
+    optuna_trials: int = 60
+    optuna_patience: int = 5
+    
+    memory_limit_mb: int = 30000
+    n_jobs: int = -1
+    batch_size: int = 32
+
+class CrossValidator:
+    def __init__(self, spec: TrainSpec):
+        self.spec = spec
+        self.main_splitter = None
+        self.group_splitter = None
+        
+    def setup(self, y: np.ndarray, groups: Optional[np.ndarray] = None):
+        self.main_splitter = StratifiedKFold(
+            n_splits=self.spec.cv_folds,
+            shuffle=True,
+            random_state=self.spec.random_state
+        )
+        
+        if groups is not None and len(np.unique(groups)) >= self.spec.cv_folds:
+            self.group_splitter = GroupKFold(n_splits=self.spec.cv_folds)
+            print(f"Using GroupKFold guardrail with {len(np.unique(groups))} groups")
+        
+    def split(self, X, y, groups=None):
+        if self.group_splitter and groups is not None:
+            return self.group_splitter.split(X, y, groups)
+        else:
+            return self.main_splitter.split(X, y)
+    
+    def get_calibration_method(self, n_samples: int) -> str:
+        if n_samples >= self.spec.min_samples_isotonic:
+            return "isotonic"
+        return self.spec.calibration_mode
+
+class RobustFeatureEngineer:
+    def __init__(self, spec: TrainSpec):
+        self.spec = spec
+        self.word_vectorizer = None
+        self.char_vectorizer = None
+        self.topic_vectorizer = None
+        self.topic_model = None
+        self.svd = None
+        self.scaler = None
+        self.pos_cache = {}
+        self.sentiment_analyzer = None
+        
+    def fit(self, texts: pd.Series, y: np.ndarray = None):
+        print("Fitting feature transformers...")
+        
+        texts_clean = texts.apply(self._clean_text)
+        
+        self.word_vectorizer = TfidfVectorizer(
+            ngram_range=(1, 2),
+            max_features=self.spec.max_tfidf_features,
+            min_df=2,
+            max_df=0.95,
+            sublinear_tf=True,
+            dtype=np.float32
+        )
+        self.word_vectorizer.fit(texts_clean)
+        
+        self.char_vectorizer = TfidfVectorizer(
+            analyzer='char',
+            ngram_range=(3, 6),
+            max_features=self.spec.max_char_features,
+            min_df=5,
+            max_df=0.95,
+            sublinear_tf=True,
+            dtype=np.float32
+        )
+        self.char_vectorizer.fit(texts_clean)
+        
+        self.topic_vectorizer = TfidfVectorizer(
+            max_features=5000,
+            min_df=2,
+            max_df=0.95
+        )
+        topic_matrix = self.topic_vectorizer.fit_transform(texts_clean)
+        
+        self.topic_model = NMF(
+            n_components=self.spec.topic_components,
+            random_state=self.spec.random_state,
+            init='nndsvda'
+        )
+        self.topic_model.fit(topic_matrix)
+        
+        if self.spec.use_sentiment and SENTIMENT_AVAILABLE:
+            self.sentiment_analyzer = SentimentIntensityAnalyzer()
+        
+        return self
+    
+    def transform(self, texts: pd.Series) -> Dict[str, np.ndarray]:
+        if self.word_vectorizer is None:
+            raise ValueError("Must fit before transform")
+        
+        texts_clean = texts.apply(self._clean_text)
+        
+        features = {}
+        
+        word_features = self.word_vectorizer.transform(texts_clean)
+        char_features = self.char_vectorizer.transform(texts_clean)
+        
+        tfidf_combined = hstack([word_features, char_features], format='csr')
+        
+        if self.svd is None:
+            self.svd = TruncatedSVD(
+                n_components=min(self.spec.svd_dim, tfidf_combined.shape[1] - 1),
+                random_state=self.spec.random_state
+            )
+            tfidf_reduced = self.svd.fit_transform(tfidf_combined)
+            
+            self.scaler = StandardScaler(with_mean=False)
+            tfidf_reduced = self.scaler.fit_transform(tfidf_reduced)
+        else:
+            tfidf_reduced = self.svd.transform(tfidf_combined)
+            tfidf_reduced = self.scaler.transform(tfidf_reduced)
+        
+        features['sparse_reduced'] = csr_matrix(tfidf_reduced)
+        
+        topic_matrix = self.topic_vectorizer.transform(texts_clean)
+        topic_features = self.topic_model.transform(topic_matrix)
+        features['topic'] = topic_features
+        
+        meta_features = self._extract_meta_features(texts_clean)
+        features['meta'] = meta_features
+        
+        if self.spec.use_sentiment:
+            sentiment_features = self._extract_sentiment_features(texts_clean)
+            features['sentiment'] = sentiment_features
+        
+        if self.spec.use_pos_features:
+            pos_features = self._extract_pos_features(texts_clean)
+            features['pos'] = pos_features
+        
+        return features
+    
+    def _clean_text(self, text: str) -> str:
+        text = str(text)
+        
+        text = unicodedata.normalize('NFKD', text)
+        
+        text = text.encode('ascii', 'ignore').decode('ascii')
+        
+        text = re.sub(r'http\S+|www.\S+', '[URL]', text)
+        text = re.sub(r'\S+@\S+', '[EMAIL]', text)
+        text = re.sub(r'@\w+', '[USER]', text)
+        
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        return text
+    
+    def _extract_meta_features(self, texts: pd.Series) -> np.ndarray:
+        features = []
+        
+        for text in texts:
+            text = str(text)
+            
+            n_chars = len(text)
+            n_words = len(text.split())
+            n_unique = len(set(text.lower().split()))
+            
+            n_caps = sum(1 for c in text if c.isupper())
+            n_punct = sum(1 for c in text if c in '!?.,:;')
+            n_digits = sum(1 for c in text if c.isdigit())
+            
+            elongations = len(re.findall(r'(.)\1{2,}', text))
+            leetspeak = sum(1 for pair in [('a','@'),('e','3'),('i','!'),('l','1'),('s','$')] 
+                          if pair[1] in text)
+            
+            features.append([
+                np.log1p(n_chars),
+                np.log1p(n_words),
+                np.log1p(n_unique),
+                n_unique / (n_words + 1),
+                n_caps / (n_chars + 1),
+                n_punct / (n_chars + 1),
+                n_digits / (n_chars + 1),
+                np.log1p(elongations),
+                np.log1p(leetspeak)
+            ])
+        
+        return np.array(features, dtype=np.float32)
+    
+    def _extract_sentiment_features(self, texts: pd.Series) -> np.ndarray:
+        features = []
+        
+        for text in texts:
+            text_str = str(text)
+            
+            try:
+                blob = TextBlob(text_str)
+                polarity = blob.sentiment.polarity
+                subjectivity = blob.sentiment.subjectivity
+            except:
+                polarity, subjectivity = 0, 0
+            
+            if self.sentiment_analyzer:
+                scores = self.sentiment_analyzer.polarity_scores(text_str)
+                compound = scores['compound']
+                pos = scores['pos']
+                neg = scores['neg']
+                neu = scores['neu']
+            else:
+                compound, pos, neg, neu = 0, 0, 0, 0
+            
+            features.append([polarity, subjectivity, compound, pos, neg, neu])
+        
+        return np.array(features, dtype=np.float32)
+    
+    def _extract_pos_features(self, texts: pd.Series) -> np.ndarray:
+        features = []
+        
+        for text in texts:
+            text_hash = hashlib.md5(str(text).encode()).hexdigest()
+            
+            if text_hash not in self.pos_cache:
+                if NLTK_AVAILABLE:
+                    try:
+                        import nltk
+                        tokens = nltk.word_tokenize(str(text)[:500])
+                        pos_tags = nltk.pos_tag(tokens)
+                        
+                        pos_counts = {}
+                        for _, tag in pos_tags:
+                            category = tag[:2]
+                            pos_counts[category] = pos_counts.get(category, 0) + 1
+                        
+                        total = len(pos_tags) + 1
+                        feature_vec = [
+                            pos_counts.get('NN', 0) / total,
+                            pos_counts.get('VB', 0) / total,
+                            pos_counts.get('JJ', 0) / total,
+                            pos_counts.get('RB', 0) / total,
+                        ]
+                    except:
+                        feature_vec = [0.25, 0.25, 0.25, 0.25]
+                else:
+                    feature_vec = [0.25, 0.25, 0.25, 0.25]
+                
+                self.pos_cache[text_hash] = feature_vec
+            
+            features.append(self.pos_cache[text_hash])
+        
+        return np.array(features, dtype=np.float32)
+
+class TransformerBackbone:
+    def __init__(self, spec: TrainSpec, mode='fine_tune'):
+        self.spec = spec
+        self.mode = mode
+        self.model = None
+        self.tokenizer = None
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+    def setup(self, n_labels=2, multi_task=False):
+        if not TRANSFORMERS_AVAILABLE:
+            return None
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(self.spec.transformer_model)
+        
+        if self.mode == 'fine_tune':
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                self.spec.transformer_model,
+                num_labels=n_labels
+            )
+        else:
+            self.model = AutoModel.from_pretrained(self.spec.transformer_model)
+        
+        self.model.to(self.device)
+        return self
+    
+    def fine_tune(self, texts, labels, val_texts=None, val_labels=None):
+        if self.mode != 'fine_tune' or not TRANSFORMERS_AVAILABLE:
+            return
+        
+        from torch.utils.data import DataLoader, TensorDataset
+        
+        train_encodings = self.tokenizer(
+            texts.tolist(),
+            truncation=True,
+            padding=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        train_dataset = TensorDataset(
+            train_encodings['input_ids'],
+            train_encodings['attention_mask'],
+            torch.tensor(labels)
+        )
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.spec.batch_size,
+            shuffle=True
+        )
+        
+        optimizer = AdamW(self.model.parameters(), lr=2e-5)
+        total_steps = len(train_loader) * 3
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(0.1 * total_steps),
+            num_training_steps=total_steps
+        )
+        
+        self.model.train()
+        for epoch in range(3):
+            for batch in train_loader:
+                batch = tuple(t.to(self.device) for t in batch)
+                inputs = {
+                    'input_ids': batch[0],
+                    'attention_mask': batch[1],
+                    'labels': batch[2]
+                }
+                
+                optimizer.zero_grad()
+                outputs = self.model(**inputs)
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+    
+    def get_embeddings(self, texts):
+        if not TRANSFORMERS_AVAILABLE:
+            return None
+        
+        self.model.eval()
+        embeddings = []
+        
+        with torch.no_grad():
+            for i in range(0, len(texts), self.spec.batch_size):
+                batch_texts = texts[i:i+self.spec.batch_size].tolist()
+                
+                encodings = self.tokenizer(
+                    batch_texts,
+                    truncation=True,
+                    padding=True,
+                    max_length=512,
+                    return_tensors='pt'
+                ).to(self.device)
+                
+                outputs = self.model(**encodings)
+                
+                if hasattr(outputs, 'last_hidden_state'):
+                    hidden = outputs.last_hidden_state
+                else:
+                    hidden = outputs[0]
+                
+                pooled = hidden.mean(dim=1).cpu().numpy()
+                embeddings.append(pooled)
+        
+        return np.vstack(embeddings)
+
+class StackingEnsemble:
+    def __init__(self, spec: TrainSpec):
+        self.spec = spec
+        self.base_models = {}
+        self.meta_model = None
+        self.oof_predictions = None
+        self.calibrators = {}
+        
+    def setup_models(self, X_shape):
+        self.base_models['logreg'] = LogisticRegression(
+            max_iter=2000,
+            C=1.0,
+            solver='liblinear',
+            class_weight='balanced',
+            random_state=self.spec.random_state
+        )
+        
+        self.base_models['sgd'] = SGDClassifier(
+            loss='log',
+            penalty='elasticnet',
+            l1_ratio=0.15,
+            class_weight='balanced',
+            random_state=self.spec.random_state
+        )
+        
+        self.base_models['lgbm_sparse'] = lgb.LGBMClassifier(
+            n_estimators=1000,
+            learning_rate=0.05,
+            num_leaves=31,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=self.spec.random_state,
+            verbosity=-1
+        )
+        
+        if ADVANCED_MODELS:
+            self.base_models['catboost'] = CatBoostClassifier(
+                iterations=500,
+                learning_rate=0.05,
+                depth=6,
+                random_seed=self.spec.random_state,
+                verbose=False
+            )
+    
+    def fit(self, X_dict, y, cv_splitter, groups=None):
+        n_samples = len(y)
+        n_models = len(self.base_models)
+        
+        self.oof_predictions = np.zeros((n_samples, n_models))
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(cv_splitter.split(X_dict['sparse_reduced'], y, groups)):
+            print(f"Generating OOF for fold {fold_idx + 1}")
+            
+            for model_idx, (name, model) in enumerate(self.base_models.items()):
+                if 'sparse' in name or 'logreg' in name or 'sgd' in name:
+                    X_train = X_dict['sparse_reduced'][train_idx]
+                    X_val = X_dict['sparse_reduced'][val_idx]
+                else:
+                    dense_features = np.hstack([
+                        X_dict['meta'][train_idx],
+                        X_dict['topic'][train_idx]
+                    ])
+                    X_train = dense_features
+                    
+                    dense_features_val = np.hstack([
+                        X_dict['meta'][val_idx],
+                        X_dict['topic'][val_idx]
+                    ])
+                    X_val = dense_features_val
+                
+                model_clone = clone(model)
+                model_clone.fit(X_train, y[train_idx])
+                pred = model_clone.predict_proba(X_val)[:, 1]
+                
+                self.oof_predictions[val_idx, model_idx] = pred
+        
+        self.meta_model = Ridge(alpha=1.0, random_state=self.spec.random_state)
+        self.meta_model.fit(self.oof_predictions, y)
+        
+        print("Refitting base models on full data...")
+        for name, model in self.base_models.items():
+            if 'sparse' in name or 'logreg' in name or 'sgd' in name:
+                X_full = X_dict['sparse_reduced']
+            else:
+                X_full = np.hstack([X_dict['meta'], X_dict['topic']])
+            
+            model.fit(X_full, y)
+            
+            calibration_method = cv_splitter.get_calibration_method(len(y))
+            self.calibrators[name] = CalibratedClassifierCV(
+                model,
+                method=calibration_method,
+                cv='prefit'
+            )
+            
+            train_pred = model.predict_proba(X_full)[:, 1]
+            self.calibrators[name].fit(X_full, y)
+        
+        return self
+    
+    def predict(self, X_dict):
+        predictions = []
+        
+        for name, model in self.base_models.items():
+            if 'sparse' in name or 'logreg' in name or 'sgd' in name:
+                X = X_dict['sparse_reduced']
+            else:
+                X = np.hstack([X_dict['meta'], X_dict['topic']])
+            
+            pred = self.calibrators[name].predict_proba(X)[:, 1]
+            predictions.append(pred)
+        
+        stacked = np.column_stack(predictions)
+        final_pred = self.meta_model.predict(stacked)
+        
+        return np.clip(final_pred, 0, 1)
+
+class HierarchicalRouter:
+    def __init__(self, spec: TrainSpec):
+        self.spec = spec
+        self.rule_classifier = None
+        self.violation_experts = {}
+        
+    def fit(self, X_dict, y, rules):
+        self.rule_classifier = lgb.LGBMClassifier(
+            n_estimators=500,
+            random_state=self.spec.random_state,
+            verbosity=-1
+        )
+        
+        X_combined = hstack([
+            X_dict['sparse_reduced'],
+            csr_matrix(X_dict['meta'])
+        ], format='csr')
+        
+        self.rule_classifier.fit(X_combined, rules)
+        
+        unique_rules = np.unique(rules)
+        for rule in unique_rules:
+            mask = rules == rule
+            if mask.sum() >= 50:
+                X_rule = X_combined[mask]
+                y_rule = y[mask]
+                
+                expert = CalibratedClassifierCV(
+                    lgb.LGBMClassifier(
+                        n_estimators=300,
+                        random_state=self.spec.random_state,
+                        verbosity=-1
+                    ),
+                    method='sigmoid',
+                    cv=3
+                )
+                expert.fit(X_rule, y_rule)
+                self.violation_experts[rule] = expert
+        
+        return self
+    
+    def predict(self, X_dict, known_rules=None):
+        X_combined = hstack([
+            X_dict['sparse_reduced'],
+            csr_matrix(X_dict['meta'])
+        ], format='csr')
+        
+        n_samples = X_combined.shape[0]
+        routed_scores = np.zeros(n_samples)
+        mixture_scores = np.zeros(n_samples)
+        
+        if known_rules is not None:
+            for i, rule in enumerate(known_rules):
+                if rule in self.violation_experts:
+                    routed_scores[i] = self.violation_experts[rule].predict_proba(
+                        X_combined[i:i+1]
+                    )[0, 1]
+                else:
+                    routed_scores[i] = 0.5
+        
+        rule_probs = self.rule_classifier.predict_proba(X_combined)
+        
+        for i in range(n_samples):
+            top_k = 3
+            top_rules = np.argsort(rule_probs[i])[-top_k:]
+            
+            weighted_score = 0
+            weight_sum = 0
+            
+            for rule_idx in top_rules:
+                rule = self.rule_classifier.classes_[rule_idx]
+                if rule in self.violation_experts:
+                    prob = rule_probs[i, rule_idx]
+                    violation_prob = self.violation_experts[rule].predict_proba(
+                        X_combined[i:i+1]
+                    )[0, 1]
+                    weighted_score += prob * violation_prob
+                    weight_sum += prob
+            
+            mixture_scores[i] = weighted_score / (weight_sum + 1e-10)
+        
+        return routed_scores, mixture_scores
+
+class BorderlineGate:
+    def __init__(self, spec: TrainSpec, entropy_threshold=0.5):
+        self.spec = spec
+        self.entropy_threshold = entropy_threshold
+        self.fast_model = None
+        
+    def fit(self, X_dict, y):
+        self.fast_model = LogisticRegression(
+            max_iter=1000,
+            solver='liblinear',
+            class_weight='balanced',
+            random_state=self.spec.random_state
+        )
+        
+        self.fast_model.fit(X_dict['sparse_reduced'], y)
+        return self
+    
+    def should_route_to_expensive(self, X_dict, base_predictions):
+        fast_prob = self.fast_model.predict_proba(X_dict['sparse_reduced'])[:, 1]
+        
+        pred_entropy = entropy(np.column_stack([
+            base_predictions,
+            1 - base_predictions
+        ]), axis=1)
+        
+        borderline_mask = (
+            (fast_prob > 0.4) & (fast_prob < 0.6) |
+            (pred_entropy > self.entropy_threshold)
+        )
+        
+        return borderline_mask
+
+class ProductionPipeline:
+    def __init__(self, spec: TrainSpec):
+        self.spec = spec
+        self.cv = CrossValidator(spec)
+        self.feature_engineer = RobustFeatureEngineer(spec)
+        self.stacker = None
+        self.hierarchical = None
+        self.gate = None
+        self.transformer = None
+        self.adversarial_weights = None
+        self.drift_monitor = {}
+        self.model_bundle = {}
+        
+    def run_adversarial_validation(self, X_train_dict, X_test_dict):
+        print("\nAdversarial Validation:")
+        
+        adv_scores = {}
+        
+        for feat_name in ['sparse_reduced', 'meta', 'topic']:
+            if feat_name not in X_train_dict:
+                continue
+                
+            X_train = X_train_dict[feat_name]
+            X_test = X_test_dict[feat_name]
+            
+            n_train = min(5000, X_train.shape[0])
+            n_test = min(5000, X_test.shape[0])
+            
+            if hasattr(X_train, 'toarray'):
+                X_train_sample = X_train[:n_train].toarray()
+                X_test_sample = X_test[:n_test].toarray()
+            else:
+                X_train_sample = X_train[:n_train]
+                X_test_sample = X_test[:n_test]
+            
+            X_combined = np.vstack([X_train_sample, X_test_sample])
+            y_combined = np.concatenate([
+                np.zeros(n_train),
+                np.ones(n_test)
+            ])
+            
+            clf = lgb.LGBMClassifier(
+                n_estimators=100,
+                random_state=self.spec.random_state,
+                verbosity=-1
+            )
+            
+            from sklearn.model_selection import cross_val_score
+            scores = cross_val_score(clf, X_combined, y_combined, cv=3, scoring='roc_auc')
+            adv_scores[feat_name] = scores.mean()
+            
+            print(f"  {feat_name}: AUC = {scores.mean():.3f}")
+        
+        max_score = max(adv_scores.values())
+        if max_score > 0.7:
+            print(f"  Distribution shift detected (max AUC = {max_score:.3f})")
+            
+            X_train_all = self._combine_features(X_train_dict)
+            X_test_all = self._combine_features(X_test_dict)
+            
+            n_train = min(10000, X_train_all.shape[0])
+            n_test = min(10000, X_test_all.shape[0])
+            
+            X_combined = vstack([X_train_all[:n_train], X_test_all[:n_test]])
+            y_combined = np.concatenate([np.zeros(n_train), np.ones(n_test)])
+            
+            clf.fit(X_combined, y_combined)
+            
+            train_probs = clf.predict_proba(X_train_all)[:, 1]
+            self.adversarial_weights = (1 - train_probs) / (train_probs + 1e-10)
+            self.adversarial_weights = np.clip(self.adversarial_weights, 0.1, 10)
+            
+            print(f"  Applied importance weights: mean={self.adversarial_weights.mean():.2f}")
+        else:
+            self.adversarial_weights = None
+    
+    def _combine_features(self, X_dict):
+        features = []
+        
+        if 'sparse_reduced' in X_dict:
+            features.append(X_dict['sparse_reduced'])
+        
+        for key in ['meta', 'topic', 'sentiment', 'pos']:
+            if key in X_dict:
+                features.append(csr_matrix(X_dict[key]))
+        
+        return hstack(features, format='csr')
+    
+    def train_with_curriculum(self, X_dict, y):
+        if not self.spec.use_curriculum:
+            return None
+        
+        print("\nCurriculum Learning:")
+        
+        simple_model = LogisticRegression(
+            max_iter=100,
+            solver='liblinear',
+            random_state=self.spec.random_state
+        )
+        simple_model.fit(X_dict['sparse_reduced'], y)
+        
+        probas = simple_model.predict_proba(X_dict['sparse_reduced'])[:, 1]
+        difficulties = np.abs(probas - 0.5)
+        
+        sorted_idx = np.argsort(difficulties)
+        
+        if self.spec.use_transformer and self.transformer:
+            stages = [
+                (0.33, 5),
+                (0.67, 3),
+                (1.0, 2),
+            ]
+            
+            for fraction, epochs in stages:
+                end_idx = int(fraction * len(sorted_idx))
+                stage_idx = sorted_idx[:end_idx]
+                
+                print(f"  Stage: {fraction:.0%} of data ({len(stage_idx)} samples)")
+    
+    def fit(self, train_df: pd.DataFrame, test_df: pd.DataFrame = None):
+        print("="*60)
+        print("PRODUCTION PIPELINE")
+        print("="*60)
+        
+        tracemalloc.start()
+        
+        y_train = train_df['rule_violation'].values
+        groups = train_df.get('subreddit', train_df.get('rule')).values
+        rules = train_df['rule'].values if 'rule' in train_df.columns else None
+        
+        self.cv.setup(y_train, groups)
+        
+        print("\nFeature Engineering:")
+        train_text = self._compose_texts(train_df)
+        self.feature_engineer.fit(train_text, y_train)
+        
+        X_train_dict = self.feature_engineer.transform(train_text)
+        
+        if test_df is not None:
+            test_text = self._compose_texts(test_df)
+            X_test_dict = self.feature_engineer.transform(test_text)
+            
+            if self.spec.use_adversarial_validation:
+                self.run_adversarial_validation(X_train_dict, X_test_dict)
+        
+        if self.spec.use_augmentation:
+            X_train_dict, y_train, groups, rules = self._augment_data(X_train_dict, y_train, train_df, groups, rules)
+        
+        if self.spec.use_transformer:
+            print("\nSetting up Transformer:")
+            self.transformer = TransformerBackbone(self.spec, mode='embed_only')
+            self.transformer.setup()
+            
+            embeddings = self.transformer.get_embeddings(train_text)
+            if embeddings is not None:
+                X_train_dict['transformer'] = embeddings
+        
+        if self.spec.use_curriculum:
+            self.train_with_curriculum(X_train_dict, y_train)
+        
+        if self.spec.use_stacking:
+            print("\nTraining Stacking Ensemble:")
+            self.stacker = StackingEnsemble(self.spec)
+            self.stacker.setup_models(X_train_dict['sparse_reduced'].shape)
+            self.stacker.fit(X_train_dict, y_train, self.cv, groups)
+            
+            self.model_bundle['oof_predictions'] = self.stacker.oof_predictions
+        
+        if self.spec.use_hierarchical and rules is not None:
+            print("\nTraining Hierarchical Router:")
+            self.hierarchical = HierarchicalRouter(self.spec)
+            self.hierarchical.fit(X_train_dict, y_train, rules)
+        
+        if self.spec.use_borderline_gate:
+            print("\nTraining Borderline Gate:")
+            self.gate = BorderlineGate(self.spec)
+            self.gate.fit(X_train_dict, y_train)
+        
+        self._setup_drift_monitor(X_train_dict, y_train)
+        
+        self._run_error_analysis(X_train_dict, y_train, groups)
+        
+        self._save_model_bundle()
+        
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        print(f"\nMemory: Current={current/1024/1024:.1f}MB, Peak={peak/1024/1024:.1f}MB")
+        
+        return self
+    
+    def predict(self, test_df: pd.DataFrame, return_all_scores=False):
+        test_text = self._compose_texts(test_df)
+        X_test_dict = self.feature_engineer.transform(test_text)
+        
+        if self.transformer:
+            embeddings = self.transformer.get_embeddings(test_text)
+            if embeddings is not None:
+                X_test_dict['transformer'] = embeddings
+        
+        results = {}
+        
+        if self.stacker:
+            stacked_pred = self.stacker.predict(X_test_dict)
+            results['stacked'] = stacked_pred
+        
+        if self.hierarchical:
+            known_rules = test_df.get('rule', None)
+            routed, mixture = self.hierarchical.predict(X_test_dict, known_rules)
+            results['routed'] = routed
+            results['mixture'] = mixture
+        
+        if self.gate and self.stacker:
+            base_preds = []
+            for name, model in self.stacker.base_models.items():
+                if 'sparse' in name or 'logreg' in name or 'sgd' in name:
+                    X = X_test_dict['sparse_reduced']
+                else:
+                    X = np.hstack([X_test_dict['meta'], X_test_dict['topic']])
+                
+                pred = model.predict_proba(X)[:, 1]
+                base_preds.append(pred)
+            
+            base_preds = np.column_stack(base_preds).mean(axis=1)
+            borderline_mask = self.gate.should_route_to_expensive(X_test_dict, base_preds)
+            results['borderline_mask'] = borderline_mask
+        
+        if 'stacked' in results:
+            final_pred = results['stacked']
+        elif 'mixture' in results:
+            final_pred = results['mixture']
+        else:
+            final_pred = np.ones(len(test_df)) * 0.5
+        
+        if return_all_scores:
+            return final_pred, results
+        return final_pred
+    
+    def _compose_texts(self, df):
+        texts = []
+        
+        for _, row in df.iterrows():
+            parts = []
+            
+            if 'body' in row and pd.notna(row['body']):
+                parts.append(f"[CONTENT] {row['body']}")
+            
+            if 'rule' in row and pd.notna(row['rule']):
+                parts.append(f"[RULE] {row['rule']}")
+            
+            if 'subreddit' in row and pd.notna(row['subreddit']):
+                parts.append(f"[COMMUNITY] r/{row['subreddit']}")
+            
+            for col in df.columns:
+                if 'positive_example' in col and pd.notna(row[col]):
+                    parts.append(f"[GOOD] {row[col]}")
+                elif 'negative_example' in col and pd.notna(row[col]):
+                    parts.append(f"[BAD] {row[col]}")
+            
+            texts.append(" ".join(parts))
+        
+        return pd.Series(texts)
+    
+    def _augment_data(self, X_dict, y, df, groups, rules):
+        minority_class = 1 if (y == 1).sum() < (y == 0).sum() else 0
+        minority_idx = np.where(y == minority_class)[0]
+        
+        if len(minority_idx) < 10:
+            return X_dict, y, groups, rules
+        
+        n_augment = int(len(minority_idx) * self.spec.augmentation_ratio)
+        n_augment = min(n_augment, 200)
+        
+        print(f"\nAugmenting {n_augment} minority samples")
+        
+        aug_idx = np.random.choice(minority_idx, n_augment, replace=True)
+        
+        X_aug_dict = {}
+        for key, features in X_dict.items():
+            if hasattr(features, 'toarray'):
+                X_aug_dict[key] = features[aug_idx]
+            else:
+                augmented = features[aug_idx].copy()
+                noise = np.random.normal(0, 0.01, augmented.shape)
+                X_aug_dict[key] = augmented + noise
+        
+        for key in X_dict.keys():
+            if hasattr(X_dict[key], 'toarray'):
+                X_dict[key] = vstack([X_dict[key], X_aug_dict[key]])
+            else:
+                X_dict[key] = np.vstack([X_dict[key], X_aug_dict[key]])
+        
+        y_aug = y[aug_idx]
+        y_combined = np.concatenate([y, y_aug])
+        
+        groups_aug = groups[aug_idx] if groups is not None else None
+        groups_combined = np.concatenate([groups, groups_aug]) if groups is not None else None
+        
+        rules_aug = rules[aug_idx] if rules is not None else None
+        rules_combined = np.concatenate([rules, rules_aug]) if rules is not None else None
+        
+        return X_dict, y_combined, groups_combined, rules_combined
+    
+    def _setup_drift_monitor(self, X_dict, y):
+        if not self.spec.track_drift:
+            return
+        
+        self.drift_monitor['prior'] = y.mean()
+        self.drift_monitor['feature_means'] = {}
+        
+        for key, features in X_dict.items():
+            if hasattr(features, 'mean'):
+                self.drift_monitor['feature_means'][key] = features.mean(axis=0)
+    
+    def _run_error_analysis(self, X_dict, y, groups):
+        print("\nError Analysis:")
+        
+        if self.stacker and self.stacker.oof_predictions is not None:
+            oof_ensemble = self.stacker.oof_predictions.mean(axis=1)
+            
+            auc = roc_auc_score(y, oof_ensemble)
+            brier = brier_score_loss(y, oof_ensemble)
+            
+            print(f"  Overall: AUC={auc:.4f}, Brier={brier:.4f}")
+            
+            if groups is not None:
+                for rule in np.unique(groups)[:5]:
+                    mask = groups == rule
+                    if mask.sum() > 10:
+                        rule_auc = roc_auc_score(y[mask], oof_ensemble[mask])
+                        print(f"  Rule '{rule}': AUC={rule_auc:.4f}")
+    
+    def _save_model_bundle(self):
+        model_dir = Path(self.spec.model_path)
+        model_dir.mkdir(exist_ok=True)
+        
+        with open(model_dir / "config.json", "w") as f:
+            json.dump(asdict(self.spec), f, indent=2)
+        
+        print(f"\nModels saved to {model_dir}")
+
+def main():
+    spec = TrainSpec()
+    
+    print("Loading data...")
+    train_df = pd.read_csv(spec.train_path)
+    test_df = pd.read_csv(spec.test_path)
+    
+    print(f"Train: {train_df.shape}")
+    print(f"Test: {test_df.shape}")
+    
+    pipeline = ProductionPipeline(spec)
+    pipeline.fit(train_df, test_df)
+    
+    print("\nMaking predictions...")
+    predictions = pipeline.predict(test_df)
+    
+    submission = pd.DataFrame({
+        'row_id': range(len(predictions)),
+        'rule_violation': predictions
+    })
+    
+    submission.to_csv("/kaggle/working/submission.csv", index=False)
+    print("\nPipeline complete!")
+
+if __name__ == "__main__":
+    main()
