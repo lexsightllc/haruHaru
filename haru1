@@ -271,8 +271,9 @@ class RobustFeatureEngineer:
                 random_state=self.spec.random_state
             )
             tfidf_reduced = self.svd.fit_transform(tfidf_combined)
-            
-            self.scaler = StandardScaler(with_mean=False)
+
+            # SVD output is dense; mean-centering improves downstream linear models.
+            self.scaler = StandardScaler(with_mean=True)
             tfidf_reduced = self.scaler.fit_transform(tfidf_reduced)
         else:
             tfidf_reduced = self.svd.transform(tfidf_combined)
@@ -398,6 +399,7 @@ class RobustFeatureEngineer:
                             pos_counts.get('JJ', 0) / total,
                             pos_counts.get('RB', 0) / total,
                         ] + [0.0]
+                        # Vector is five-dimensional; last slot flags missing POS context.
                     except (LookupError, nltk.NLTKError):
                         feature_vec = [0.0, 0.0, 0.0, 0.0, 1.0]
                 else:
@@ -988,18 +990,14 @@ class ProductionPipeline:
             results['mixture'] = mixture
         
         if self.gate and self.stacker:
-            base_preds = []
-            for name, model in self.stacker.base_models.items():
+            base_preds_list = []
+            for name, _ in self.stacker.base_models.items():
                 feat_keys = self.stacker.model_features.get(name, ['sparse_reduced'])
-                if len(feat_keys) == 1 and hasattr(X_test_dict[feat_keys[0]], 'tocsr'):
-                    X = X_test_dict[feat_keys[0]]
-                else:
-                    X = np.hstack([X_test_dict[key] for key in feat_keys])
+                X = self.stacker._assemble_features(X_test_dict, feat_keys)
+                pred = self.stacker.calibrators[name].predict_proba(X)[:, 1]
+                base_preds_list.append(pred)
 
-                pred = model.predict_proba(X)[:, 1]
-                base_preds.append(pred)
-            
-            base_preds = np.column_stack(base_preds).mean(axis=1)
+            base_preds = np.column_stack(base_preds_list).mean(axis=1)
             borderline_mask = self.gate.should_route_to_expensive(X_test_dict, base_preds)
             results['borderline_mask'] = borderline_mask
         
@@ -1015,29 +1013,37 @@ class ProductionPipeline:
         return final_pred
     
     def _compose_texts(self, df):
-        texts = []
-        
-        for _, row in df.iterrows():
+        positive_cols = [col for col in df.columns if 'positive_example' in col]
+        negative_cols = [col for col in df.columns if 'negative_example' in col]
+
+        def compose_row(row):
             parts = []
-            
-            if 'body' in row and pd.notna(row['body']):
-                parts.append(f"[CONTENT] {row['body']}")
-            
-            if 'rule' in row and pd.notna(row['rule']):
-                parts.append(f"[RULE] {row['rule']}")
-            
-            if 'subreddit' in row and pd.notna(row['subreddit']):
-                parts.append(f"[COMMUNITY] r/{row['subreddit']}")
-            
-            for col in df.columns:
-                if 'positive_example' in col and pd.notna(row[col]):
-                    parts.append(f"[GOOD] {row[col]}")
-                elif 'negative_example' in col and pd.notna(row[col]):
-                    parts.append(f"[BAD] {row[col]}")
-            
-            texts.append(" ".join(parts))
-        
-        return pd.Series(texts)
+
+            body = row.get('body')
+            if pd.notna(body):
+                parts.append(f"[CONTENT] {body}")
+
+            rule = row.get('rule')
+            if pd.notna(rule):
+                parts.append(f"[RULE] {rule}")
+
+            subreddit = row.get('subreddit')
+            if pd.notna(subreddit):
+                parts.append(f"[COMMUNITY] r/{subreddit}")
+
+            for col in positive_cols:
+                value = row.get(col)
+                if pd.notna(value):
+                    parts.append(f"[GOOD] {value}")
+
+            for col in negative_cols:
+                value = row.get(col)
+                if pd.notna(value):
+                    parts.append(f"[BAD] {value}")
+
+            return " ".join(parts)
+
+        return df.apply(compose_row, axis=1)
     
     def _augment_data(self, X_dict, y, df, groups, rules):
         minority_class = 1 if (y == 1).sum() < (y == 0).sum() else 0
