@@ -2,11 +2,6 @@
 # NOTE: This is a Python script (not JavaScript). Reviews/tooling should treat it as Python.
 
 import os
-
-# Disable debugger warnings
-os.environ['PYDEVD_DISABLE_FILE_VALIDATION'] = '1'
-os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
-
 import warnings
 import logging
 logger = logging.getLogger("pipeline")
@@ -65,16 +60,20 @@ try:
 except ImportError:
     SENTIMENT_AVAILABLE = False
 
-import nltk
 
-
-def _ensure_nltk_resources() -> bool:
-    """Ensure tokenizer & POS tagger availability across NLTK variants."""
+def _ensure_nltk_resources(nltk_data_env: Optional[str] = None) -> bool:
+    """
+    Ensure tokenizer & POS tagger exist. Uses NLTK_DATA env var if provided.
+    Avoids modifying nltk.data.path globally.
+    """
 
     try:
-        nltk.data.path.append('/kaggle/input/nltk-data/')
+        if nltk_data_env:
+            os.environ.setdefault("NLTK_DATA", nltk_data_env)
 
-        def _has_tagger() -> bool:
+        import nltk  # lazy import
+
+        def _tagger_exists() -> bool:
             try:
                 nltk.data.find('taggers/averaged_perceptron_tagger_eng/')
                 return True
@@ -87,7 +86,7 @@ def _ensure_nltk_resources() -> bool:
 
         try:
             nltk.data.find('tokenizers/punkt')
-            if not _has_tagger():
+            if not _tagger_exists():
                 raise LookupError("POS tagger not found")
         except LookupError:
             if not os.path.exists('/kaggle'):
@@ -104,7 +103,7 @@ def _ensure_nltk_resources() -> bool:
         return False
 
 
-NLTK_AVAILABLE = _ensure_nltk_resources()
+NLTK_AVAILABLE = _ensure_nltk_resources(os.environ.get("NLTK_DATA"))
 
 try:
     import optuna
@@ -137,11 +136,13 @@ class TrainSpec:
     train_path: str = "/kaggle/input/jigsaw-agile-community-rules/train.csv"
     test_path: str = "/kaggle/input/jigsaw-agile-community-rules/test.csv"
     model_path: str = "/kaggle/working/models"
-    
+
     random_state: int = 42
+    # Use n_splits_cv for scikit-learn consistency; cv_folds kept for backward-compat.
+    n_splits_cv: int = 5
     cv_folds: int = 5
     early_stopping_rounds: int = 50
-    
+
     max_tfidf_features: int = 30000
     max_char_features: int = 20000
     svd_dim: int = 1024
@@ -149,7 +150,7 @@ class TrainSpec:
     use_sentiment: bool = True
     use_pos_features: bool = True
     topic_components: int = 20
-    
+
     use_transformer: bool = True
     transformer_model: str = "distilbert-base-uncased"
     use_stacking: bool = True
@@ -160,6 +161,7 @@ class TrainSpec:
     hier_expert_min_samples: int = 50
     borderline_low: float = 0.4
     borderline_high: float = 0.6
+    # Entropy threshold for the borderline gate: higher => fewer samples routed to “expensive” path.
     entropy_threshold: float = 0.5
     transformer_epochs: int = 3
     transformer_max_length: int = 512
@@ -178,19 +180,22 @@ class TrainSpec:
     use_augmentation: bool = True
     augmentation_ratio: float = 0.2
     augmentation_max: int = 200
-    augmentation_noise_std: float = 0.01  # documentable knob
-    
+    # Text cleaning options
+    ascii_sanitize: bool = False  # if True, drop non-ASCII (can lose signal on non-Latin text)
+    # Augmentation noise (opt-in): std dev for Gaussian noise added to dense features
+    augmentation_noise_std: float = 0.0
+
     calibration_mode: str = "sigmoid"
     min_samples_isotonic: int = 300
-    
+
     use_onnx: bool = False
     use_conformal: bool = True
     track_drift: bool = True
-    
+
     optimize_hyperparams: bool = OPTUNA_AVAILABLE
     optuna_trials: int = 60
     optuna_patience: int = 5
-    
+
     memory_limit_mb: int = 30000
     n_jobs: int = -1
     batch_size: int = 32
@@ -199,25 +204,29 @@ class TrainSpec:
     adv_val_max_all: int = 10000
     # CatBoost feature toggle
     catboost_use_svd: bool = False
+    # Logging to file in addition to console; None = console only
+    log_file: Optional[str] = None
+    # Optional NLTK data directory (used to set NLTK_DATA)
+    nltk_data_dir: Optional[str] = None
 
 class CrossValidator:
     def __init__(self, spec: TrainSpec):
         self.spec = spec
         self.main_splitter = None
         self.group_splitter = None
-        
+
     def setup(self, y: np.ndarray, groups: Optional[np.ndarray] = None):
+        n_splits = getattr(self.spec, "n_splits_cv", self.spec.cv_folds)
         self.main_splitter = StratifiedKFold(
-            n_splits=self.spec.cv_folds,
+            n_splits=n_splits,
             shuffle=True,
             random_state=self.spec.random_state
         )
-        
-        if groups is not None and len(np.unique(groups)) >= 2:
-            n_splits = min(self.spec.cv_folds, len(np.unique(groups)))
+
+        if groups is not None and len(np.unique(groups)) >= n_splits:
             try:
                 self.group_splitter = GroupKFold(n_splits=n_splits)
-                logger.info(f"Using GroupKFold with {len(np.unique(groups))} groups and {n_splits} splits")
+                logger.info("Using GroupKFold guardrail with %d groups", len(np.unique(groups)))
             except ValueError as e:
                 logger.warning(f"GroupKFold unavailable ({e}); falling back to StratifiedKFold")
                 self.group_splitter = None
@@ -247,7 +256,7 @@ class RobustFeatureEngineer:
         self.sentiment_analyzer = None
         
     def fit(self, texts: pd.Series, y: np.ndarray = None):
-        logger.info("Fitting feature transformers…")
+        logger.info("Fitting feature transformers...")
         
         texts_clean = texts.apply(self._clean_text)
         
@@ -340,15 +349,16 @@ class RobustFeatureEngineer:
     
     def _clean_text(self, text: str) -> str:
         text = str(text)
-        
+
         text = unicodedata.normalize('NFKD', text)
-        
-        text = text.encode('ascii', 'ignore').decode('ascii')
-        
+
+        if self.spec.ascii_sanitize:
+            text = text.encode('ascii', 'ignore').decode('ascii')
+
         text = re.sub(r'http\S+|www.\S+', '[URL]', text)
         text = re.sub(r'\S+@\S+', '[EMAIL]', text)
         text = re.sub(r'@\w+', '[USER]', text)
-        
+
         text = re.sub(r'<[^>]+>', '', text)
         
         return text
@@ -389,8 +399,7 @@ class RobustFeatureEngineer:
                 polarity = blob.sentiment.polarity
                 subjectivity = blob.sentiment.subjectivity
             except (ValueError, TypeError, AttributeError) as exc:
-                import warnings as _warn
-                _warn.warn(f"TextBlob sentiment failed: {exc}")
+                logger.warning("TextBlob sentiment failed: %s", exc)
                 polarity, subjectivity = 0, 0
             
             if self.sentiment_analyzer:
@@ -413,12 +422,13 @@ class RobustFeatureEngineer:
 
         features = []
 
+        import nltk  # local import, outside the inner loop
+
         for text in texts:
             text_hash = hashlib.md5(str(text).encode()).hexdigest()
 
             if text_hash not in self.pos_cache:
                 try:
-                    import nltk
                     tokens = nltk.word_tokenize(str(text)[:self.spec.pos_max_chars])
                     pos_tags = nltk.pos_tag(tokens)
 
@@ -636,7 +646,7 @@ class StackingEnsemble:
         self.oof_predictions = None
         self.calibrators = {}
         
-    def setup_models(self, X_shape):
+    def setup_models(self):
         self.base_models['logreg'] = LogisticRegression(
             max_iter=2000,
             C=1.0,
@@ -739,7 +749,7 @@ class StackingEnsemble:
             meta_fit_kwargs['sample_weight'] = sample_weight
         self.meta_model.fit(self.oof_predictions, y, **meta_fit_kwargs)
 
-        logger.info("Refitting base models and calibrating…")
+        logger.info("Refitting base models and calibrating...")
         for name, model in self.base_models.items():
             feat_keys = self.model_features.get(name, ['sparse_reduced'])
             X_full = self._assemble_features(X_dict, feat_keys)
@@ -755,6 +765,7 @@ class StackingEnsemble:
             else:
                 self._fit_with_sw(model, X_full, y, sw_full)
 
+            # Calibrate with the same splitter family when available for consistency; fallback to a fresh StratifiedKFold.
             skf = cv_splitter.main_splitter or StratifiedKFold(
                 n_splits=5, shuffle=True, random_state=self.spec.random_state
             )
@@ -942,7 +953,6 @@ class ProductionPipeline:
         self.hierarchical = None
         self.gate = None
         self.transformer = None
-        self._train_texts = None
         self.adversarial_weights = None
         self.drift_monitor = {}
         self.model_bundle = {}
@@ -962,8 +972,15 @@ class ProductionPipeline:
             n_train = min(self.spec.adv_val_max_train, X_train.shape[0])
             n_test = min(self.spec.adv_val_max_train, X_test.shape[0])
 
-            X_train_sample = X_train[:n_train]
-            X_test_sample = X_test[:n_test]
+            rng = np.random.RandomState(self.spec.random_state)
+            tr_idx = rng.choice(X_train.shape[0], size=n_train, replace=False)
+            te_idx = rng.choice(X_test.shape[0], size=n_test, replace=False)
+            X_train_sample = X_train[tr_idx]
+            X_test_sample = X_test[te_idx]
+
+            if hasattr(X_train_sample, 'toarray'):
+                X_train_sample = X_train_sample.toarray()
+                X_test_sample = X_test_sample.toarray()
 
             from scipy.sparse import vstack as sp_vstack
             X_combined = sp_vstack([X_train_sample, X_test_sample]) if issparse(X_train_sample) else np.vstack([X_train_sample, X_test_sample])
@@ -998,7 +1015,11 @@ class ProductionPipeline:
             n_train = min(self.spec.adv_val_max_all, X_train_all.shape[0])
             n_test = min(self.spec.adv_val_max_all, X_test_all.shape[0])
 
-            X_combined = vstack([X_train_all[:n_train], X_test_all[:n_test]])
+            rng = np.random.RandomState(self.spec.random_state)
+            tr_idx = rng.choice(X_train_all.shape[0], size=n_train, replace=False)
+            te_idx = rng.choice(X_test_all.shape[0], size=n_test, replace=False)
+
+            X_combined = vstack([X_train_all[tr_idx], X_test_all[te_idx]])
             y_combined = np.concatenate([np.zeros(n_train), np.ones(n_test)])
 
             clf.fit(X_combined, y_combined)
@@ -1024,7 +1045,7 @@ class ProductionPipeline:
 
         return hstack(features, format='csr')
     
-    def train_with_curriculum(self, X_dict, y):
+    def train_with_curriculum(self, X_dict, y, train_texts: Optional[pd.Series] = None):
         if not self.spec.use_curriculum:
             return None
         
@@ -1046,7 +1067,7 @@ class ProductionPipeline:
             self.spec.use_transformer
             and self.transformer
             and getattr(self.transformer, "mode", "") == "fine_tune"
-            and hasattr(self, "_train_texts")
+            and train_texts is not None
         ):
             for fraction, epochs in self.spec.curriculum_stages:
                 end_idx = int(fraction * len(sorted_idx))
@@ -1054,7 +1075,7 @@ class ProductionPipeline:
                 logger.info("  Transformer stage: %.0f%% (%d samples, %d epochs)", fraction * 100, len(stage_idx), epochs)
                 self.transformer.spec.transformer_epochs = epochs
                 self.transformer.fine_tune(
-                    self._train_texts.iloc[stage_idx],
+                    train_texts.iloc[stage_idx],
                     y[stage_idx]
                 )
     
@@ -1076,9 +1097,8 @@ class ProductionPipeline:
 
         self.cv.setup(y_train, groups)
 
-        logger.info("Feature Engineering…")
+        logger.info("Feature Engineering...")
         train_text = self._compose_texts(train_df)
-        self._train_texts = train_text
         self.feature_engineer.fit(train_text, y_train)
 
         X_train_dict = self.feature_engineer.transform(train_text)
@@ -1094,7 +1114,7 @@ class ProductionPipeline:
             X_train_dict, y_train, groups, rules = self._augment_data(X_train_dict, y_train, train_df, groups, rules)
 
         if self.spec.use_transformer:
-            logger.info("Setting up Transformer backbone…")
+            logger.info("Setting up Transformer backbone...")
             self.transformer = TransformerBackbone(self.spec, mode='embed_only')
             self.transformer.setup()
 
@@ -1107,12 +1127,12 @@ class ProductionPipeline:
                     X_train_dict['transformer'] = embeddings
 
         if self.spec.use_curriculum:
-            self.train_with_curriculum(X_train_dict, y_train)
+            self.train_with_curriculum(X_train_dict, y_train, train_text)
 
         if self.spec.use_stacking:
-            logger.info("Training Stacking Ensemble…")
+            logger.info("Training Stacking Ensemble...")
             self.stacker = StackingEnsemble(self.spec)
-            self.stacker.setup_models(X_train_dict['sparse_reduced'].shape)
+            self.stacker.setup_models()
             self.stacker.fit(
                 X_train_dict,
                 y_train,
@@ -1124,12 +1144,12 @@ class ProductionPipeline:
             self.model_bundle['oof_predictions'] = self.stacker.oof_predictions
 
         if self.spec.use_hierarchical and rules is not None:
-            logger.info("Training Hierarchical Router…")
+            logger.info("Training Hierarchical Router...")
             self.hierarchical = HierarchicalRouter(self.spec)
             self.hierarchical.fit(X_train_dict, y_train, rules)
 
         if self.spec.use_borderline_gate:
-            logger.info("Training Borderline Gate…")
+            logger.info("Training Borderline Gate...")
             self.gate = BorderlineGate(self.spec)
             self.gate.fit(X_train_dict, y_train, sample_weight=self.adversarial_weights)
 
@@ -1240,7 +1260,11 @@ class ProductionPipeline:
                 X_aug_dict[key] = features[aug_idx]
             else:
                 augmented = features[aug_idx].copy()
-                noise = np.random.normal(0, self.spec.augmentation_noise_std, augmented.shape)
+                noise = (
+                    np.random.normal(0, self.spec.augmentation_noise_std, augmented.shape)
+                    if self.spec.augmentation_noise_std > 0
+                    else 0.0
+                )
                 X_aug_dict[key] = augmented + noise
         
         for key in X_dict.keys():
@@ -1291,6 +1315,8 @@ class ProductionPipeline:
                 max_rules = self.spec.error_rules_max
                 if isinstance(max_rules, int) and max_rules > 0:
                     unique_rules = unique_rules[:max_rules]
+                if hasattr(self, "hierarchical") and self.hierarchical and self.hierarchical.rule_classes_ is None:
+                    raise NotFittedError("HierarchicalRouter not fitted; run fit() before error analysis.")
                 for rule in unique_rules:
                     mask = groups == rule
                     if mask.sum() > 10:
@@ -1309,6 +1335,8 @@ class ProductionPipeline:
             warnings.warn(f"Joblib not available, skipping bundle persistence: {exc}")
             return
 
+        # SECURITY NOTE (critical): joblib uses pickle; only load this bundle from trusted sources,
+        # preferably in a sandboxed context. Consider ONNX or other safer formats for untrusted exchange.
         joblib.dump({
             "feature_engineer": self.feature_engineer,
             "stacker": self.stacker,
@@ -1328,34 +1356,58 @@ class ProductionPipeline:
                 logger.info(f"Transformer saved to {tdir}")
             except Exception as exc:
                 logger.warning(f"Failed to save transformer: {exc}")
-        logger.warning("SECURITY: joblib uses pickle. Only load bundle.joblib from trusted sources.")
+        logger.warning(
+            "SECURITY: joblib uses pickle. Only load bundle.joblib from trusted sources and consider sandboxing."
+        )
 
-def setup_logging(level=logging.INFO):
-    """Configure logging once at runtime."""
+def setup_logging(level=logging.INFO, log_file: Optional[str] = None):
+    """Configure logging once, on execution, not on import. Optional file handler."""
 
-    if not logger.handlers:
-        logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if logger.handlers:
+        return
+
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+    )
+
+
+def setup_environment(spec: TrainSpec):
+    """Centralize environment tweaks to avoid import-time side effects."""
+
+    os.environ.setdefault('PYDEVD_DISABLE_FILE_VALIDATION', '1')
+    os.environ.setdefault('PYTHONDONTWRITEBYTECODE', '1')
+    if spec.nltk_data_dir:
+        os.environ.setdefault('NLTK_DATA', spec.nltk_data_dir)
+    global NLTK_AVAILABLE
+    NLTK_AVAILABLE = _ensure_nltk_resources(os.environ.get("NLTK_DATA"))
 
 
 def main():
-    # configure logging and set seeds at runtime (avoids import-time side effects)
-    setup_logging()
-    set_all_seeds(42)
+    # Configure environment, logging, and seeds at runtime (no import-time side effects)
     spec = TrainSpec()
+    setup_environment(spec)
+    setup_logging(log_file=spec.log_file)
+    set_all_seeds(spec.random_state)
 
-    logger.info("Loading data…")
-    train_df = pd.read_csv(spec.train_path)
-    test_df = pd.read_csv(spec.test_path)
+    logger.info("Loading data...")
+    train_df = pd.read_csv(spec.train_path, encoding="utf-8")
+    test_df = pd.read_csv(spec.test_path, encoding="utf-8")
 
     logger.info(f"Train: {train_df.shape}  Test: {test_df.shape}")
 
     pipeline = ProductionPipeline(spec)
     pipeline.fit(train_df, test_df)
 
-    logger.info("Making predictions…")
+    logger.info("Making predictions...")
     predictions = pipeline.predict(test_df)
 
-    logger.info("Building submission…")
+    logger.info("Building submission...")
 
     pred = np.asarray(predictions, dtype=float)
     pred = np.clip(pred, 0.0, 1.0)
